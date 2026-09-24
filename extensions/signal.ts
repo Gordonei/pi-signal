@@ -37,10 +37,18 @@ const ALLOWED_NUMBERS = new Set(
 );
 
 // Helper: check whether a number is allowed.
+// Default behaviour: only PI_SIGNAL_ACCOUNT (self) is allowed.
+// If PI_SIGNAL_ALLOWLIST is set, those numbers are additionally allowed.
 function isAllowedNumber(number: string): boolean {
-	if (!PI_SIGNAL_ALLOWLIST) return true; // empty allowlist = allow all
 	const cleaned = number.replace(/[\s\-().]/g, "");
-	return ALLOWED_NUMBERS.has(cleaned) || cleaned === PI_SIGNAL_ACCOUNT;
+	// Self is always allowed
+	if (cleaned === PI_SIGNAL_ACCOUNT) return true;
+	// If allowlist is set, check against it
+	if (PI_SIGNAL_ALLOWLIST) {
+		return ALLOWED_NUMBERS.has(cleaned);
+	}
+	// Empty allowlist = only self allowed
+	return false;
 }
 
 // Default stats mode
@@ -775,10 +783,23 @@ export default function (pi: ExtensionAPI) {
 		body: string;
 		timestamp: number;
 	}) {
-		if (parsed.number !== PI_SIGNAL_ACCOUNT) {
+		// Note-to-Self messages: only process from own account
+		if (parsed.number === PI_SIGNAL_ACCOUNT) {
+			const body = parsed.body.trim();
+			if (body.startsWith("/")) {
+				const parts = body.slice(1).split(/\s+/);
+				const cmd = parts[0].toLowerCase();
+				const args = parts.slice(1);
+				handleCommand(parsed, cmd, args).catch((err) => {
+					console.error(`[signal] command error (${cmd}):`, err);
+				});
+			} else if (!paused) {
+				forwardToAgent(parsed);
+			}
 			return;
 		}
 
+		// Messages from others: check allowlist
 		if (!isAllowedNumber(parsed.number)) {
 			console.log(
 				`[signal] blocked message from ${parsed.number} (not in allowlist)`,
@@ -798,8 +819,8 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		// Check for commands
 		const body = parsed.body.trim();
-
 		if (body.startsWith("/")) {
 			const parts = body.slice(1).split(/\s+/);
 			const cmd = parts[0].toLowerCase();
@@ -810,6 +831,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		// Normal message — forward to agent, unless paused
 		if (paused) {
 			sendToSignal(parsed.number, "⏸ Paused. Send /resume to re-enable.").catch(
 				() => {},
