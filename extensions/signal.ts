@@ -238,8 +238,8 @@ export default function (pi: ExtensionAPI) {
 
 	/**
 	 * Parse a message from the REST API WebSocket format.
-	 * The WebSocket in json-rpc-native mode sends JSON like:
-	 * { account: "+27727924107", envelope: { source, sourceNumber, sourceUuid, dataMessage, ... } }
+	 * In json-rpc-native mode the WebSocket sends JSON-RPC messages like:
+	 * { jsonrpc: "2.0", method: "receive", params: { envelope: {...}, account: "..." } }
 	 */
 	function parseEnvelope(data: string): {
 		sender: string;
@@ -257,8 +257,10 @@ export default function (pi: ExtensionAPI) {
 
 		const obj = raw as Record<string, unknown>;
 
-		// Extract envelope (the REST API wraps it under "envelope" key)
-		const env = obj.envelope as Record<string, unknown> | undefined;
+		// In json-rpc-native mode, envelope is under params;
+		// in native/native mode it would be directly on the object.
+		const env = (obj.params as Record<string, unknown> | undefined)?.envelope
+			|| obj.envelope as Record<string, unknown> | undefined;
 		if (!env) return null;
 
 		// Extract message body
