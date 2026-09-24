@@ -65,6 +65,7 @@ Send a Note-to-Self from your phone. pi receives it (👀), processes it, and re
 | `PI_SIGNAL_DAEMON_URL` | No | `http://127.0.0.1:8080` | Daemon URL for JSON-RPC and SSE |
 | `PI_SIGNAL_STATS` | No | `short` | Stats mode: `off`, `short`, or `full` |
 | `PI_SIGNAL_QUIET_DAEMON` | No | `true` | Keep message content out of journalctl (secure default). Set `"false"` to surface daemon output for debugging |
+| `PI_SIGNAL_DEBUG` | No | `false` | Set `"true"` or `"1"` to enable verbose debug logging from the Signal extension |
 
 ## Commands (from Signal)
 

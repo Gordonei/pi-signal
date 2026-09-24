@@ -26,6 +26,21 @@ const PI_SIGNAL_PRIMARY =
 	process.env.PI_SIGNAL_PRIMARY === "1" ||
 	process.env.PI_SIGNAL_PRIMARY === "yes";
 
+// Debug logging: when set to true/1/log, all debug messages are shown.
+// When false/0/undefined, only console.error messages appear.
+const PI_SIGNAL_DEBUG = (process.env.PI_SIGNAL_DEBUG || "false").toLowerCase();
+const DEBUG_ENABLED = PI_SIGNAL_DEBUG === "true" || PI_SIGNAL_DEBUG === "1" || PI_SIGNAL_DEBUG === "log";
+
+/**
+ * Debug logger — outputs only when PI_SIGNAL_DEBUG is enabled.
+ * Uses console.log internally, so it respects normal log filtering.
+ */
+function debug(...args: unknown[]): void {
+	if (DEBUG_ENABLED) {
+		console.log(...args);
+	}
+}
+
 // Allowlist of phone numbers (comma-separated, E.164 format, no spaces).
 const PI_SIGNAL_ALLOWLIST = (process.env.PI_SIGNAL_ALLOWLIST || "").trim();
 
@@ -141,11 +156,13 @@ async function sendMessage(
 	recipient: string,
 	message: string,
 ): Promise<boolean> {
+	debug(`[signal] sendMessage -> recipients=[${recipient}], as=${PI_SIGNAL_ACCOUNT}`);
 	const res = await restApi("POST", "/v1/send", {
 		number: PI_SIGNAL_ACCOUNT,
 		recipients: [recipient],
 		message,
 	});
+	debug(`[signal] sendMessage result: ok=${res.ok}, error=${res.error}`);
 	return res.ok;
 }
 
@@ -183,7 +200,7 @@ async function removeReaction(
 async function listContacts(): Promise<Array<Record<string, unknown>>> {
 	const res = await restApi("GET", `/v1/contacts/${encodeURIComponent(PI_SIGNAL_ACCOUNT)}?all_recipients=true`);
 	if (!res.ok || !Array.isArray(res.result)) {
-		console.log(`[signal] listContacts failed: ${res.error || "unknown"}`);
+		console.error(`[signal] listContacts failed: ${res.error || "unknown"}`);
 		return [];
 	}
 	return res.result as Array<Record<string, unknown>>;
@@ -250,18 +267,30 @@ export default function (pi: ExtensionAPI) {
 		let raw: unknown;
 		try {
 			raw = JSON.parse(data);
-		} catch {
+		} catch (err) {
+			console.error(`[signal] JSON parse failed: ${(err as Error).message}`);
 			return null;
 		}
-		if (!raw || typeof raw !== "object") return null;
+		if (!raw || typeof raw !== "object") {
+			console.error(`[signal] not an object, type=${typeof raw}`);
+			return null;
+		}
 
 		const obj = raw as Record<string, unknown>;
 
+		// Debug: log top-level keys to identify format
+		debug(`[signal] WS top-level keys: [${Object.keys(obj).join(", ")}]`);
+
 		// In json-rpc-native mode, envelope is under params;
 		// in native/native mode it would be directly on the object.
-		const env = (obj.params as Record<string, unknown> | undefined)?.envelope
+		const paramsObj = obj.params as Record<string, unknown> | undefined;
+		const env = paramsObj?.envelope as Record<string, unknown> | undefined
 			|| obj.envelope as Record<string, unknown> | undefined;
-		if (!env) return null;
+		if (!env) {
+			console.error(`[signal] no envelope found (params?.envelope=${!!paramsObj?.envelope}, obj.envelope=${!!obj.envelope})`);
+			return null;
+		}
+		debug(`[signal] envelope keys: [${Object.keys(env).join(", ")}]`);
 
 		// Extract message body
 		let body: string | undefined;
@@ -271,6 +300,7 @@ export default function (pi: ExtensionAPI) {
 		if (env.dataMessage && typeof env.dataMessage === "object") {
 			const dm = env.dataMessage as Record<string, unknown>;
 			body = (dm.body as string | undefined) || (dm.message as string | undefined);
+			debug(`[signal] dataMessage body=${JSON.stringify(body)}, fields=${Object.keys(dm).join(", ")}`);
 		}
 
 		// Check syncMessage (Note to Self / synced from other devices)
@@ -286,8 +316,10 @@ export default function (pi: ExtensionAPI) {
 					(sentMsg.body as string | undefined);
 				if (body && PI_SIGNAL_ACCOUNT && destination === PI_SIGNAL_ACCOUNT) {
 					isNoteToSelf = true;
+					debug(`[signal] Note-to-Self: dest=${destination} === account=${PI_SIGNAL_ACCOUNT}`);
 				} else if (body) {
 					// A synced message to someone else — ignore it.
+					dropped synced msg to other, dest=${destination}`);
 					return null;
 				}
 			}
@@ -296,7 +328,10 @@ export default function (pi: ExtensionAPI) {
 					(sm.body as string | undefined) || (sm.message as string | undefined);
 			}
 		}
-		if (!body || typeof body !== "string" || body.trim() === "") return null;
+		if (!body || typeof body !== "string" || body.trim() === "") {
+			console.error(`[signal] no body extracted, body=${JSON.stringify(body)}`);
+			return null;
+		}
 
 		// Extract message timestamp
 		let timestamp: number = 0;
@@ -478,7 +513,7 @@ export default function (pi: ExtensionAPI) {
 			};
 			sendToSignal(parsed.number, text).then((ok) => {
 				if (ok) {
-					console.log(`[signal] command reply sent: ${cmd}`);
+					debug(`[signal] command reply sent: ${cmd}`);
 				} else {
 					console.error(`[signal] failed to send command reply: ${cmd}`);
 				}
@@ -611,11 +646,11 @@ export default function (pi: ExtensionAPI) {
 			if (typeof (ctx as any).newSession === "function") {
 				await (ctx as any).newSession({
 					withSession: async (_newCtx: unknown) => {
-						console.log("[signal] new session started via /clear");
+						debug("[signal] new session started via /clear");
 					},
 				});
 			} else {
-				console.log("[signal] newSession not available on context");
+				debug("[signal] newSession not available on context");
 			}
 		} catch (err) {
 			console.error("[signal] /clear error:", err);
@@ -785,6 +820,7 @@ export default function (pi: ExtensionAPI) {
 		body: string;
 		timestamp: number;
 	}) {
+		debug(`[signal] injectMessage: number=${parsed.number}, account=${PI_SIGNAL_ACCOUNT}, paused=${paused}`);
 		// Note-to-Self messages: only process from own account
 		if (parsed.number === PI_SIGNAL_ACCOUNT) {
 			const body = parsed.body.trim();
@@ -803,7 +839,7 @@ export default function (pi: ExtensionAPI) {
 
 		// Messages from others: check allowlist
 		if (!isAllowedNumber(parsed.number)) {
-			console.log(
+			debug(
 				`[signal] blocked message from ${parsed.number} (not in allowlist)`,
 			);
 			if (parsed.timestamp) {
@@ -852,7 +888,7 @@ export default function (pi: ExtensionAPI) {
 	 */
 	function startWebSocketListener(): void {
 		if (!PI_SIGNAL_PRIMARY) {
-			console.log(
+			debug(
 				"[signal] PI_SIGNAL_PRIMARY is not set — skipping WebSocket listener.",
 			);
 			return;
@@ -878,13 +914,13 @@ export default function (pi: ExtensionAPI) {
 		const protocol = isHttps ? "wss://" : "ws://";
 		const wsUrl = `${protocol}${baseUrl.hostname}:${baseUrl.port || 80}${wsPath}`;
 
-		console.log(`[signal] connecting WebSocket to ${wsUrl}`);
+		debug(`[signal] connecting WebSocket to ${wsUrl}`);
 
 		try {
 			const ws = new WebSocket(wsUrl);
 
 			ws.onopen = () => {
-				console.log("[signal] WebSocket connected — listening for incoming messages");
+				debug("[signal] WebSocket connected — listening for incoming messages");
 				wsConnected = true;
 				wsReconnectDelay = SSE_RETRY_DELAY_INITIAL;
 			};
@@ -893,9 +929,13 @@ export default function (pi: ExtensionAPI) {
 				const data = typeof event.data === "string" ? event.data : event.data.toString("utf8");
 				if (!data.trim()) return;
 
+				debug(`[signal] WS raw (first 200): ${data.slice(0, 200)}`);
 				const parsed = parseEnvelope(data);
 				if (parsed) {
+					debug(`[signal] parsed -> from ${parsed.number}: "${parsed.body}"`);
 					injectMessage(parsed);
+				} else {
+					console.error(`[signal] parseEnvelope returned null — message DROPPED`);
 				}
 			};
 
@@ -905,7 +945,7 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			ws.onclose = (event: CloseEvent) => {
-				console.log(`[signal] WebSocket closed (code: ${event.code})`);
+				debug(`[signal] WebSocket closed (code: ${event.code})`);
 				wsConnected = false;
 				scheduleWsReconnect();
 			};
@@ -924,7 +964,7 @@ export default function (pi: ExtensionAPI) {
 		if (wsReconnectTimer) return;
 
 		const delay = wsReconnectDelay;
-		console.log(`[signal] reconnecting WebSocket in ${delay}ms`);
+		debug(`[signal] reconnecting WebSocket in ${delay}ms`);
 
 		wsReconnectTimer = setTimeout(() => {
 			wsReconnectTimer = null;
@@ -963,13 +1003,13 @@ export default function (pi: ExtensionAPI) {
 			if (number && number === PI_SIGNAL_ACCOUNT) {
 				const uuid = (contact.uuid as string) || (contact.aci as string) || null;
 				if (uuid) {
-					console.log(`[signal] resolved account UUID: ${uuid}`);
+					debug(`[signal] resolved account UUID: ${uuid}`);
 					return uuid;
 				}
 			}
 		}
 
-		console.log("[signal] account not found in contacts — using phone number");
+		debug("[signal] account not found in contacts — using phone number");
 		return null;
 	}
 
@@ -994,7 +1034,10 @@ export default function (pi: ExtensionAPI) {
 				"\n\n[truncated — response too long for Signal]";
 		}
 
-		const targetId = resolvedAccountId || PI_SIGNAL_ACCOUNT;
+		// For Note-to-Self replies, use resolved UUID for grey (synced) rendering.
+		// For external replies, send to the original sender's number.
+		const isSelf = _recipient === PI_SIGNAL_ACCOUNT;
+		const targetId = isSelf && resolvedAccountId ? resolvedAccountId : _recipient;
 		const ok = await sendMessage(targetId, text);
 		return ok;
 	}
@@ -1011,7 +1054,11 @@ export default function (pi: ExtensionAPI) {
 
 	// Auto-send agent responses back to Signal, with stats footer
 	pi.on("agent_end", async (event: unknown, ctx: unknown) => {
-		if (!currentSignalSender) return;
+		debug(`[signal] agent_end: currentSignalSender=${currentSignalSender ? JSON.stringify(currentSignalSender) : "null"}`);
+		if (!currentSignalSender) {
+			debug("[signal] agent_end: no currentSignalSender, skipping");
+			return;
+		}
 
 		const sender = currentSignalSender;
 		currentSignalSender = null;
@@ -1057,7 +1104,7 @@ export default function (pi: ExtensionAPI) {
 
 			const ok = await sendToSignal(sender.number, fullText);
 			if (ok) {
-				console.log(`[signal] auto-reply sent to ${sender.number}`);
+				debug(`[signal] auto-reply sent to ${sender.number}`);
 				if (sender.timestamp) {
 					await removeReaction(sender.number, sender.number, sender.timestamp);
 					await sendReaction(
@@ -1087,7 +1134,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("model_select", async (event: unknown) => {
 		const ev = event as { model?: { name?: string; id?: string } };
 		if (ev?.model) {
-			console.log(
+			debug(
 				`[signal] model switched to ${ev.model.name || ev.model.id || "unknown"}`,
 			);
 		}

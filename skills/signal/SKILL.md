@@ -116,6 +116,7 @@ pi extension (signal.ts)
 | `PI_SIGNAL_DAEMON_URL` | No | `http://127.0.0.1:8080` | Daemon URL for JSON-RPC and SSE |
 | `PI_SIGNAL_STATS` | No | `short` | Default stats mode: `off`, `short`, or `full` |
 | `PI_SIGNAL_QUIET_DAEMON` | No | `true` | Silence signal-cli daemon stdout so message content stays out of `journalctl` (the secure default). Set to `"false"` to surface daemon output in the journal for debugging. |
+| `PI_SIGNAL_DEBUG` | No | `false` | Set to `"true"` or `"1"` to enable verbose debug logging from the Signal extension. When off, only `console.error` messages appear. |
 
 > **Note:** The `PI_SIGNAL_INCOMING_LOG` variable has been removed. Messages are now streamed in-memory via SSE for better security.
 
