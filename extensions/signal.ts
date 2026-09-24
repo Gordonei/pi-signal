@@ -319,7 +319,7 @@ export default function (pi: ExtensionAPI) {
 					debug(`[signal] Note-to-Self: dest=${destination} === account=${PI_SIGNAL_ACCOUNT}`);
 				} else if (body) {
 					// A synced message to someone else — ignore it.
-					dropped synced msg to other, dest=${destination}`);
+					debug(`dropped synced msg to other, dest=${destination}`);
 					return null;
 				}
 			}
