@@ -272,7 +272,7 @@ export default function (pi: ExtensionAPI) {
 			return null;
 		}
 		if (!raw || typeof raw !== "object") {
-			console.error(`[signal] not an object, type=${typeof raw}`);
+			debug(`[signal] not an object, type=${typeof raw}`);
 			return null;
 		}
 
@@ -287,7 +287,7 @@ export default function (pi: ExtensionAPI) {
 		const env = paramsObj?.envelope as Record<string, unknown> | undefined
 			|| obj.envelope as Record<string, unknown> | undefined;
 		if (!env) {
-			console.error(`[signal] no envelope found (params?.envelope=${!!paramsObj?.envelope}, obj.envelope=${!!obj.envelope})`);
+			debug(`[signal] no envelope found (params?.envelope=${!!paramsObj?.envelope}, obj.envelope=${!!obj.envelope})`);
 			return null;
 		}
 		debug(`[signal] envelope keys: [${Object.keys(env).join(", ")}]`);
@@ -329,7 +329,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		if (!body || typeof body !== "string" || body.trim() === "") {
-			console.error(`[signal] no body extracted, body=${JSON.stringify(body)}`);
+			debug(`[signal] no body extracted, body=${JSON.stringify(body)}`);
 			return null;
 		}
 
@@ -935,7 +935,7 @@ export default function (pi: ExtensionAPI) {
 					debug(`[signal] parsed -> from ${parsed.number}: "${parsed.body}"`);
 					injectMessage(parsed);
 				} else {
-					console.error(`[signal] parseEnvelope returned null — message DROPPED`);
+					debug(`[signal] parseEnvelope returned null — message DROPPED`);
 				}
 			};
 
