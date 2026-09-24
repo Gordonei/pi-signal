@@ -32,6 +32,26 @@ const PI_SIGNAL_PRIMARY =
 	process.env.PI_SIGNAL_PRIMARY === "1" ||
 	process.env.PI_SIGNAL_PRIMARY === "yes";
 
+// Allowlist of phone numbers (comma-separated, E.164 format, no spaces).
+// If set, only messages from these numbers are processed and only messages
+// to these numbers can be sent.  The PI_SIGNAL_ACCOUNT is always allowed.
+// Leave empty to allow all numbers (default, backward-compatible).
+const PI_SIGNAL_ALLOWLIST = (process.env.PI_SIGNAL_ALLOWLIST || "").trim();
+
+// Parse the allowlist into a Set of normalized E.164 numbers.
+const ALLOWED_NUMBERS = new Set(
+	PI_SIGNAL_ALLOWLIST.split(",")
+		.map((n) => n.replace(/[\s\-().]/g, ""))
+		.filter((n) => /^[+]?\d+$/.test(n)),
+);
+
+// Helper: check whether a number is allowed (in allowlist or account is self).
+function isAllowedNumber(number: string): boolean {
+	if (!PI_SIGNAL_ALLOWLIST) return true; // empty allowlist = allow all
+	const cleaned = number.replace(/[\s\-().]/g, "");
+	return ALLOWED_NUMBERS.has(cleaned) || cleaned === PI_SIGNAL_ACCOUNT;
+}
+
 // Default stats mode: "off" | "short" | "full"
 const DEFAULT_STATS_MODE = (
 	process.env.PI_SIGNAL_STATS || "short"
@@ -724,6 +744,27 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		// Allowlist check: reject senders not in the allowlist (self always allowed).
+		if (!isAllowedNumber(parsed.number)) {
+			console.log(
+				`[signal] blocked message from ${parsed.number} (not in allowlist)`,
+			);
+			// Optional: send a quick rejection reply
+			if (parsed.timestamp) {
+				pendingReaction = {
+					recipient: parsed.number,
+					targetAuthor: parsed.number,
+					timestamp: parsed.timestamp,
+				};
+				sendReaction(parsed.number, parsed.number, parsed.timestamp, "🚫")
+					.then(() => {
+						sendToSignal(parsed.number, "⛔ Your number is not in the allowlist. Contact the admin to be added.").catch(() => {});
+					})
+					.catch(() => {});
+			}
+			return;
+		}
+
 		const body = parsed.body.trim();
 
 		// Check for commands
@@ -1210,6 +1251,13 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
+			// Allowlist check: reject recipients not in the allowlist (self always allowed).
+			if (!isAllowedNumber(cleaned)) {
+				throw new Error(
+					`Recipient ${cleaned} is not in the Signal allowlist. Only messages to allowed numbers can be sent.`,
+				);
+			}
+
 			// For self-recipient (Note-to-Self), use the resolved UUID so
 			// signal-cli routes through sendSelfMessage → grey (synced)
 			// rendering. Always include `account` — signal-cli needs it to
@@ -1562,6 +1610,15 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (!message) {
 				extensionCtx.ui?.notify?.("Message is empty.", "error");
+				return;
+			}
+
+			// Allowlist check: reject recipients not in the allowlist (self always allowed).
+			if (!isAllowedNumber(cleaned)) {
+				extensionCtx.ui?.notify?.(
+					`⛔ ${cleaned} is not in the Signal allowlist. Only messages to allowed numbers can be sent.`,
+					"error",
+				);
 				return;
 			}
 
