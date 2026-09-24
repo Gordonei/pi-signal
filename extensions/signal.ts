@@ -5,37 +5,28 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import * as http from "node:http";
+import * as https from "node:https";
 import * as path from "node:path";
 
 // ── Configuration ─────────────────────────────────────────────────────
 
-// Absolute path to the installed package root (parent of extensions/), so
-// commands can point at scripts/setup.sh regardless of where pi installed
-// this package (npm registry install, local dev checkout, etc). `pi` runs
-// extensions through jiti, which supports CommonJS-style `__dirname` even
-// though this file is authored as an ES module.
 const PACKAGE_ROOT = path.resolve(__dirname, "..");
 const SETUP_SCRIPT_PATH = path.join(PACKAGE_ROOT, "scripts", "setup.sh");
 
 const PI_SIGNAL_ACCOUNT = process.env.PI_SIGNAL_ACCOUNT || "";
 
-// The daemon exposes a JSON-RPC API for sends and an SSE endpoint for receives.
-// Uses in-memory SSE streaming — no log file on disk (more secure).
+// REST API base URL for bbernhard/signal-cli-rest-api
 const SIGNAL_DAEMON_URL =
-	process.env.PI_SIGNAL_DAEMON_URL || "http://127.0.0.1:8080";
+	process.env.PI_SIGNAL_DAEMON_URL || "http://127.0.0.1:8090";
 
 // When running multiple pi instances, only the primary instance should
-// process Signal messages. Set PI_SIGNAL_PRIMARY=true on the instance
-// that should handle Signal. All other instances ignore incoming messages.
+// process Signal messages.
 const PI_SIGNAL_PRIMARY =
 	process.env.PI_SIGNAL_PRIMARY === "true" ||
 	process.env.PI_SIGNAL_PRIMARY === "1" ||
 	process.env.PI_SIGNAL_PRIMARY === "yes";
 
 // Allowlist of phone numbers (comma-separated, E.164 format, no spaces).
-// If set, only messages from these numbers are processed and only messages
-// to these numbers can be sent.  The PI_SIGNAL_ACCOUNT is always allowed.
-// Leave empty to allow all numbers (default, backward-compatible).
 const PI_SIGNAL_ALLOWLIST = (process.env.PI_SIGNAL_ALLOWLIST || "").trim();
 
 // Parse the allowlist into a Set of normalized E.164 numbers.
@@ -45,35 +36,171 @@ const ALLOWED_NUMBERS = new Set(
 		.filter((n) => /^[+]?\d+$/.test(n)),
 );
 
-// Helper: check whether a number is allowed (in allowlist or account is self).
+// Helper: check whether a number is allowed.
 function isAllowedNumber(number: string): boolean {
 	if (!PI_SIGNAL_ALLOWLIST) return true; // empty allowlist = allow all
 	const cleaned = number.replace(/[\s\-().]/g, "");
 	return ALLOWED_NUMBERS.has(cleaned) || cleaned === PI_SIGNAL_ACCOUNT;
 }
 
-// Default stats mode: "off" | "short" | "full"
+// Default stats mode
 const DEFAULT_STATS_MODE = (
 	process.env.PI_SIGNAL_STATS || "short"
 ).toLowerCase();
 
-// SSE reconnect backoff parameters (mirrors hermes-agent)
-const SSE_RETRY_DELAY_INITIAL = 2000; // ms
-const SSE_RETRY_DELAY_MAX = 60_000; // ms
+// SSE reconnect backoff (kept for compatibility with status reporting)
+const SSE_RETRY_DELAY_INITIAL = 2000;
+const SSE_RETRY_DELAY_MAX = 60_000;
+
+// ── REST API helper ───────────────────────────────────────────────────
+
+/**
+ * Issue a REST request to the bbernhard/signal-cli-rest-api container.
+ * This replaces the old JSON-RPC daemonRpc() calls.
+ */
+async function restApi(
+	method: "GET" | "POST" | "PUT" | "DELETE",
+	path: string,
+	body?: Record<string, unknown>,
+): Promise<{ ok: boolean; result?: unknown; error?: string }> {
+	const baseUrl = new URL(SIGNAL_DAEMON_URL);
+	const url = new URL(path, SIGNAL_DAEMON_URL);
+	// Use the hostname/port from the base URL but keep the path
+	const target = new URL(path, SIGNAL_DAEMON_URL);
+
+	const isHttps = baseUrl.protocol === "https:";
+	const lib = isHttps ? https : http;
+
+	const headers: Record<string, string> = {
+		"Content-Type": "application/json",
+	};
+
+	const opts: http.RequestOptions = {
+		hostname: target.hostname,
+		port: target.port || (isHttps ? 443 : 80),
+		path: target.pathname + (target.search || ""),
+		method,
+		headers,
+		timeout: 15000,
+	};
+
+	return new Promise((resolve) => {
+		const req = lib.request(opts, (res) => {
+			const chunks: Buffer[] = [];
+			res.on("data", (chunk: Buffer) => chunks.push(chunk));
+			res.on("end", () => {
+				const raw = Buffer.concat(chunks).toString("utf8");
+				if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+					try {
+						resolve({ ok: true, result: JSON.parse(raw) });
+					} catch {
+						// No content (204) or non-JSON
+						if (raw.trim()) {
+							resolve({ ok: true, result: raw });
+						} else {
+							resolve({ ok: true, result: null });
+						}
+					}
+				} else {
+					try {
+						const err = JSON.parse(raw);
+						resolve({ ok: false, error: err?.error || "unknown error" });
+					} catch {
+						resolve({ ok: false, error: `HTTP ${res.statusCode || "unknown"}` });
+					}
+				}
+			});
+		});
+
+		req.on("error", (err) => {
+			resolve({ ok: false, error: err.message });
+		});
+
+		req.on("timeout", () => {
+			req.destroy();
+			resolve({ ok: false, error: "request timeout" });
+		});
+
+		if (body) {
+			req.write(JSON.stringify(body));
+		}
+		req.end();
+	});
+}
+
+/** Send a signal message via the REST API. */
+async function sendMessage(
+	recipient: string,
+	message: string,
+): Promise<boolean> {
+	const res = await restApi("POST", "/v1/send", {
+		number: PI_SIGNAL_ACCOUNT,
+		recipients: [recipient],
+		message,
+	});
+	return res.ok;
+}
+
+/** Send an emoji reaction via the REST API. */
+async function sendReaction(
+	recipient: string,
+	targetAuthor: string,
+	timestamp: number,
+	emoji: string,
+): Promise<boolean> {
+	const res = await restApi("POST", `/v1/reactions/${encodeURIComponent(PI_SIGNAL_ACCOUNT)}`, {
+		reaction: emoji,
+		recipient,
+		target_author: targetAuthor,
+		timestamp,
+	});
+	return res.ok;
+}
+
+/** Remove a reaction via the REST API. */
+async function removeReaction(
+	recipient: string,
+	targetAuthor: string,
+	timestamp: number,
+): Promise<boolean> {
+	const res = await restApi("DELETE", `/v1/reactions/${encodeURIComponent(PI_SIGNAL_ACCOUNT)}`, {
+		recipient,
+		target_author: targetAuthor,
+		timestamp,
+	});
+	return res.ok;
+}
+
+/** List contacts via the REST API. */
+async function listContacts(): Promise<Array<Record<string, unknown>>> {
+	const res = await restApi("GET", `/v1/contacts/${encodeURIComponent(PI_SIGNAL_ACCOUNT)}?all_recipients=true`);
+	if (!res.ok || !Array.isArray(res.result)) {
+		console.log(`[signal] listContacts failed: ${res.error || "unknown"}`);
+		return [];
+	}
+	return res.result as Array<Record<string, unknown>>;
+}
+
+/** Get the about/version info of the API. */
+async function getApiAbout(): Promise<{ ok: boolean; version?: string }> {
+	const res = await restApi("GET", "/v1/about");
+	if (!res.ok) return { ok: false };
+	const data = res.result as Record<string, unknown> | undefined;
+	return {
+		ok: true,
+		version: (data?.version as string) || undefined,
+	};
+}
 
 // ── Extension ──────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	// SSE stream state
-	let sseRequest: http.ClientRequest | null = null;
-	let sseReconnectTimer: ReturnType<typeof setTimeout> | null = null;
-	let sseReconnectDelay = SSE_RETRY_DELAY_INITIAL;
-	let sseConnected = false;
+	// WebSocket / SSE state (WebSocket for json-rpc-native mode)
+	let wsConnected = false;
+	let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	let wsReconnectDelay = SSE_RETRY_DELAY_INITIAL;
 
-	// Resolved Signal UUID (ACI) for our own account — resolves from
-	// phone number to UUID at startup via listContacts RPC. Using the
-	// UUID rather than the raw phone number in recipient triggers
-	// signal-cli's sendSelfMessage() path → grey (synced) bubbles.
+	// Resolved Signal UUID (ACI) for our own account
 	let resolvedAccountId: string | null = null;
 
 	// Pending reaction (Note-to-Self feedback cycle)
@@ -93,29 +220,20 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Feature state ────────────────────────────────────────────────
 
-	/** Stored extension context (captured from session_start) for command handling */
 	let extCtx: ExtensionContext | null = null;
-
-	/** Stats verbosity mode. Can be changed via /stats command. */
 	let statsMode: "off" | "short" | "full" =
 		DEFAULT_STATS_MODE === "full" ? "full"
 		: DEFAULT_STATS_MODE === "off" ? "off"
 		: "short";
-
-	/**
-	 * When true, normal messages from Signal are NOT forwarded to the agent.
-	 * Toggled via /pause and /resume. Commands (including /resume) still work.
-	 */
 	let paused = false;
-
-	/** The last agent reply text sent back to Signal, for /resend. */
 	let lastAgentReply: string | null = null;
 
 	/**
-	 * Parse a single JSON line from the signal-cli daemon SSE stream.
-	 * Format: { envelope: { source, sourceName, dataMessage, syncMessage } }
+	 * Parse a message from the REST API WebSocket format.
+	 * The WebSocket in json-rpc-native mode sends JSON like:
+	 * { account: "+27727924107", envelope: { source, sourceNumber, sourceUuid, dataMessage, ... } }
 	 */
-	function parseEnvelope(line: string): {
+	function parseEnvelope(data: string): {
 		sender: string;
 		number: string;
 		body: string;
@@ -123,45 +241,31 @@ export default function (pi: ExtensionAPI) {
 	} | null {
 		let raw: unknown;
 		try {
-			raw = JSON.parse(line);
+			raw = JSON.parse(data);
 		} catch {
 			return null;
 		}
 		if (!raw || typeof raw !== "object") return null;
 
-		// Extract envelope from native SSE format
-		let env: Record<string, unknown> | null = null;
-		if (
-			raw !== null &&
-			typeof raw === "object" &&
-			"envelope" in (raw as Record<string, unknown>)
-		) {
-			env = (raw as Record<string, unknown>).envelope as Record<
-				string,
-				unknown
-			>;
-		}
+		const obj = raw as Record<string, unknown>;
+
+		// Extract envelope (the REST API wraps it under "envelope" key)
+		const env = obj.envelope as Record<string, unknown> | undefined;
 		if (!env) return null;
 
 		// Extract message body
-		// Note: "Note to Self" messages arrive as syncMessage.sentMessage (not dataMessage)
 		let body: string | undefined;
 		let isNoteToSelf = false;
+
+		// Check dataMessage (normal incoming messages)
 		if (env.dataMessage && typeof env.dataMessage === "object") {
 			const dm = env.dataMessage as Record<string, unknown>;
-			body =
-				(dm.body as string | undefined) || (dm.message as string | undefined);
+			body = (dm.body as string | undefined) || (dm.message as string | undefined);
 		}
-		// Check for syncMessage (Note to Self / messages synced from other devices)
+
+		// Check syncMessage (Note to Self / synced from other devices)
 		if (!body && env.syncMessage && typeof env.syncMessage === "object") {
 			const sm = env.syncMessage as Record<string, unknown>;
-			// Note to Self: body is in syncMessage.sentMessage.message, AND the
-			// message was addressed to our own account (destination === account).
-			// signal-cli emits syncMessage.sentMessage for EVERY message this
-			// account sends from any linked device — to anyone — so the presence
-			// of a sentMessage body is NOT enough; we must confirm the recipient
-			// is ourselves, otherwise messages you send to other people would be
-			// treated as Note-to-Self and forwarded to the agent.
 			if (sm.sentMessage && typeof sm.sentMessage === "object") {
 				const sentMsg = sm.sentMessage as Record<string, unknown>;
 				const destination =
@@ -173,11 +277,10 @@ export default function (pi: ExtensionAPI) {
 				if (body && PI_SIGNAL_ACCOUNT && destination === PI_SIGNAL_ACCOUNT) {
 					isNoteToSelf = true;
 				} else if (body) {
-					// A synced message to someone else — ignore it entirely.
+					// A synced message to someone else — ignore it.
 					return null;
 				}
 			}
-			// Fallback: direct body on syncMessage (some sync events)
 			if (!body) {
 				body =
 					(sm.body as string | undefined) || (sm.message as string | undefined);
@@ -188,32 +291,22 @@ export default function (pi: ExtensionAPI) {
 		// Extract message timestamp
 		let timestamp: number = 0;
 		if (env.dataMessage && typeof env.dataMessage === "object") {
-			timestamp =
-				((env.dataMessage as Record<string, unknown>).timestamp as number) || 0;
+			timestamp = ((env.dataMessage as Record<string, unknown>).timestamp as number) || 0;
 		}
-		// For sync messages, get timestamp from sentMessage
-		if (
-			!timestamp &&
-			isNoteToSelf &&
-			env.syncMessage &&
-			typeof env.syncMessage === "object"
-		) {
+		if (!timestamp && isNoteToSelf && env.syncMessage && typeof env.syncMessage === "object") {
 			const sm = env.syncMessage as Record<string, unknown>;
 			if (sm.sentMessage && typeof sm.sentMessage === "object") {
-				timestamp =
-					((sm.sentMessage as Record<string, unknown>).timestamp as number) ||
-					0;
+				timestamp = ((sm.sentMessage as Record<string, unknown>).timestamp as number) || 0;
 			}
 		}
 
 		// Extract sender number
-		// For Note to Self messages, sender is the account itself
 		let number = "unknown";
 		if (isNoteToSelf && PI_SIGNAL_ACCOUNT) {
 			number = PI_SIGNAL_ACCOUNT;
-		} else if (typeof env.sourceNumber === "string") {
+		} else if (typeof env.sourceNumber === "string" && env.sourceNumber) {
 			number = env.sourceNumber;
-		} else if (typeof env.source === "string") {
+		} else if (typeof env.source === "string" && env.source) {
 			number = env.source;
 		}
 
@@ -230,7 +323,6 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Command Handlers ────────────────────────────────────────────
 
-	/** Build a stats footer string for the current context. */
 	function buildStatsFooter(
 		ctx: ExtensionContext | null,
 	): string {
@@ -242,11 +334,9 @@ export default function (pi: ExtensionAPI) {
 		const provider = model?.provider || "";
 
 		const tokensIn = usage?.tokens != null ? usage.tokens : null;
-		const ctxWindow = usage?.contextWindow || null;
 		const pct = usage?.percent != null ? usage.percent : null;
 
 		if (statsMode === "short") {
-			// e.g. "───\nClaude Sonnet 4 · 1.2K ctx · 24%"
 			const parts: string[] = [modelName];
 			if (tokensIn != null) {
 				parts.push(formatTokens(tokensIn) + " ctx");
@@ -257,7 +347,7 @@ export default function (pi: ExtensionAPI) {
 			return "\n───\n" + parts.join(" · ");
 		}
 
-		// Full mode
+		const ctxWindow = usage?.contextWindow || null;
 		const lines: string[] = ["───"];
 		lines.push(`Model: ${modelName}${provider ? " (" + provider + ")" : ""}`);
 		if (tokensIn != null) {
@@ -277,14 +367,6 @@ export default function (pi: ExtensionAPI) {
 		return String(n);
 	}
 
-	/**
-	 * Neutralize an untrusted contact display name before it enters the agent's
-	 * context. Contact names/usernames come from third parties' Signal profiles,
-	 * so a malicious contact could embed newlines + instructions to prompt-inject
-	 * the agent when the user asks to "send this to <name>". Collapse control
-	 * characters, newlines, bidi and zero-width marks to plain spaces, then cap
-	 * the length. Ordinary names pass through unchanged.
-	 */
 	function sanitizeContactName(s: string): string {
 		return s
 			.replace(/[\u0000-\u001F\u007F\u200B-\u200F\u2028\u2029]+/g, " ")
@@ -293,7 +375,6 @@ export default function (pi: ExtensionAPI) {
 			.slice(0, 100);
 	}
 
-	/** Simple Levenshtein distance between two strings. */
 	function levenshtein(a: string, b: string): number {
 		const m = a.length;
 		const n = b.length;
@@ -314,10 +395,6 @@ export default function (pi: ExtensionAPI) {
 		return dp[m][n];
 	}
 
-	/**
-	 * Fuzzy-match a partial query against a list of model labels.
-	 * Returns sorted matches with scores (0 = exact, higher = worse).
-	 */
 	function fuzzyMatchModels(
 		query: string,
 		models: Array<{ label: string; model: unknown }>,
@@ -331,15 +408,12 @@ export default function (pi: ExtensionAPI) {
 			const label = entry.label.toLowerCase();
 			let score = Infinity;
 
-			// Exact match (case-insensitive)
 			if (label === q) {
 				score = 0;
 			} else if (label.includes(q)) {
-		// Substring match — strong signal with slight position bonus
-		const pos = label.indexOf(q);
-		score = 0.02 + (pos / Math.max(label.length, 1)) * 0.05;
+				const pos = label.indexOf(q);
+				score = 0.02 + (pos / Math.max(label.length, 1)) * 0.05;
 			} else {
-				// Levenshtein distance normalized by max length
 				const dist = levenshtein(label, q);
 				const maxLen = Math.max(label.length, q.length);
 				score = dist / Math.max(maxLen, 1);
@@ -348,7 +422,6 @@ export default function (pi: ExtensionAPI) {
 			scored.push({ label: entry.label, model: entry.model, score });
 		}
 
-		// Sort by score ascending, then by label length (prefer shorter matches)
 		scored.sort((a, b) => {
 			if (a.score !== b.score) return a.score - b.score;
 			return a.label.length - b.label.length;
@@ -357,7 +430,6 @@ export default function (pi: ExtensionAPI) {
 		return scored;
 	}
 
-	/** Get all available models from context, formatted as {label, model} entries. */
 	function getModelList(ctx: ExtensionContext): Array<{ label: string; model: unknown }> {
 		const registry = ctx.modelRegistry;
 		if (!registry || typeof registry.getAll !== "function") return [];
@@ -377,7 +449,6 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	/** Handle a Signal message that is a command (/model, /abort, /clear, /stats). */
 	async function handleCommand(
 		parsed: { sender: string; number: string; body: string; timestamp: number },
 		cmd: string,
@@ -385,7 +456,6 @@ export default function (pi: ExtensionAPI) {
 	): Promise<void> {
 		const ctx = extCtx;
 		if (!ctx) {
-			// Can't handle commands without context — forward to LLM
 			forwardToAgent(parsed);
 			return;
 		}
@@ -396,7 +466,6 @@ export default function (pi: ExtensionAPI) {
 				sender: parsed.sender,
 				timestamp: parsed.timestamp,
 			};
-			// Use sendToSignal directly since we're handling inline
 			sendToSignal(parsed.number, text).then((ok) => {
 				if (ok) {
 					console.log(`[signal] command reply sent: ${cmd}`);
@@ -430,12 +499,10 @@ export default function (pi: ExtensionAPI) {
 			case "help":
 				return handleHelpCommand(parsed, reply);
 			default:
-				// Unknown command — forward to LLM as normal message
 				forwardToAgent(parsed);
 		}
 	}
 
-	/** /model <partial_name> — fuzzy-match and switch model */
 	async function handleModelCommand(
 		ctx: ExtensionContext,
 		args: string[],
@@ -457,7 +524,6 @@ export default function (pi: ExtensionAPI) {
 
 		const matches = fuzzyMatchModels(query, models);
 
-		// Check for exact model ID match before fuzzy matching
 		const qLower = query.toLowerCase().trim();
 		for (const entry of models) {
 			const entryObj = entry.model as { id?: string };
@@ -472,21 +538,16 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
-		// Filter to reasonable matches (score < 0.5)
 		const good = matches.filter((m) => m.score < 0.5);
 		if (good.length === 0) {
-			// Show closest few
 			const closest = matches.slice(0, 5);
-			const lines = closest.map(
-				(m, i) => `${i + 1}. ${m.label}`,
-			);
+			const lines = closest.map((m, i) => `${i + 1}. ${m.label}`);
 			reply(
 				`No close match for "${query}". Did you mean:\n${lines.join("\n")}`,
 			);
 			return;
 		}
 
-		// If exact or very close match (score < 0.15), switch immediately
 		const best = good[0];
 		if (good.length === 1 && best.score < 0.15) {
 			const ok = await pi.setModel(best.model as any);
@@ -498,7 +559,6 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// Multiple matches — show options
 		const show = good.slice(0, 10);
 		const lines = show.map((m, i) => `${i + 1}. ${m.label}`);
 		reply(
@@ -506,7 +566,6 @@ export default function (pi: ExtensionAPI) {
 		);
 	}
 
-	/** /abort — stop the current LLM generation */
 	async function handleAbortCommand(
 		ctx: ExtensionContext,
 		parsed: { sender: string; number: string; body: string; timestamp: number },
@@ -520,23 +579,19 @@ export default function (pi: ExtensionAPI) {
 		ctx.abort();
 		reply("⏹ Response aborted.");
 
-		// Swap 👀 → 🛑 on the original message
 		if (parsed.timestamp) {
 			await removeReaction(parsed.number, parsed.number, parsed.timestamp);
 			await sendReaction(parsed.number, parsed.number, parsed.timestamp, "🛑");
 		}
 	}
 
-	/** /clear — start a new session */
 	async function handleClearCommand(
 		ctx: ExtensionContext,
 		parsed: { sender: string; number: string; body: string; timestamp: number },
 		reply: (text: string) => void,
 	): Promise<void> {
-		// If currently streaming, abort first
 		if (!ctx.isIdle()) {
 			ctx.abort();
-			// Small wait to let abort settle
 			await new Promise((r) => setTimeout(r, 300));
 		}
 
@@ -557,7 +612,6 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	/** /stats [short|full|off] — view or change stats mode */
 	async function handleStatsCommand(
 		parsed: { sender: string; number: string; body: string; timestamp: number },
 		args: string[],
@@ -566,7 +620,6 @@ export default function (pi: ExtensionAPI) {
 		const arg = args[0]?.toLowerCase();
 
 		if (!arg) {
-			// Show current stats mode and usage
 			const ctx = extCtx;
 			let usageLine = "";
 			if (ctx) {
@@ -587,21 +640,18 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	/** Forward a message to the LLM agent (normal flow). */
 	function forwardToAgent(parsed: {
 		sender: string;
 		number: string;
 		body: string;
 		timestamp: number;
 	}) {
-		// Track sender context for auto-response
 		currentSignalSender = {
 			number: parsed.number,
 			sender: parsed.sender,
 			timestamp: parsed.timestamp,
 		};
 
-		// Send 👀 reaction immediately on received message
 		if (parsed.timestamp) {
 			pendingReaction = {
 				recipient: parsed.number,
@@ -619,7 +669,6 @@ export default function (pi: ExtensionAPI) {
 		pi.sendUserMessage(formatted, { deliverAs: "followUp" });
 	}
 
-	/** /help — list available commands */
 	async function handleHelpCommand(
 		parsed: { sender: string; number: string; body: string; timestamp: number },
 		reply: (text: string) => void,
@@ -639,13 +688,6 @@ export default function (pi: ExtensionAPI) {
 		);
 	}
 
-	/**
-	 * /status — report live status from in-memory state ONLY (no network
-	 * calls). Receiving this command already proves the daemon and SSE stream
-	 * are healthy, so we never need to hit the daemon — the reply is instant
-	 * and cannot hang. Note: if pi or the daemon is down, this command is never
-	 * received in the first place, so /status can only ever confirm "up".
-	 */
 	async function handleStatusCommand(
 		parsed: { sender: string; number: string; body: string; timestamp: number },
 		reply: (text: string) => void,
@@ -658,7 +700,7 @@ export default function (pi: ExtensionAPI) {
 			"✅ pi is up and receiving Signal.",
 			`Account: ${PI_SIGNAL_ACCOUNT || "(not set)"}`,
 			`Primary: ${PI_SIGNAL_PRIMARY ? "yes" : "no"}`,
-			`SSE stream: ${sseConnected ? "connected" : "disconnected"}`,
+			`REST API: ${wsConnected ? "connected" : "disconnected"}`,
 			`Model: ${modelName}${providerSuffix}`,
 			`Stats: ${statsMode}`,
 			`State: ${paused ? "⏸ paused (send /resume)" : "active"}`,
@@ -666,7 +708,6 @@ export default function (pi: ExtensionAPI) {
 		reply(lines.join("\n"));
 	}
 
-	/** /resend — re-send the last agent reply (recover a dropped message). */
 	async function handleResendCommand(
 		parsed: { sender: string; number: string; body: string; timestamp: number },
 		reply: (text: string) => void,
@@ -678,7 +719,6 @@ export default function (pi: ExtensionAPI) {
 		reply(lastAgentReply);
 	}
 
-	/** /whoami — show current model, working directory, and session. */
 	async function handleWhoamiCommand(
 		parsed: { sender: string; number: string; body: string; timestamp: number },
 		reply: (text: string) => void,
@@ -703,7 +743,6 @@ export default function (pi: ExtensionAPI) {
 		reply(lines.join("\n"));
 	}
 
-	/** /pause — stop forwarding normal messages to the agent. */
 	async function handlePauseCommand(
 		parsed: { sender: string; number: string; body: string; timestamp: number },
 		reply: (text: string) => void,
@@ -718,7 +757,6 @@ export default function (pi: ExtensionAPI) {
 		);
 	}
 
-	/** /resume — resume forwarding normal messages to the agent. */
 	async function handleResumeCommand(
 		parsed: { sender: string; number: string; body: string; timestamp: number },
 		reply: (text: string) => void,
@@ -731,25 +769,20 @@ export default function (pi: ExtensionAPI) {
 		reply("▶️ Resumed. Messages will be processed again.");
 	}
 
-	/** Intercept commands from Signal: /model, /abort, /clear, /stats, /status, /whoami, /resend, /pause, /resume, /help */
 	function injectMessage(parsed: {
 		sender: string;
 		number: string;
 		body: string;
 		timestamp: number;
 	}) {
-		// Only process Note-to-Self messages (from own account). Silently drop
-		// anything else — no log; these are just other people's messages.
 		if (parsed.number !== PI_SIGNAL_ACCOUNT) {
 			return;
 		}
 
-		// Allowlist check: reject senders not in the allowlist (self always allowed).
 		if (!isAllowedNumber(parsed.number)) {
 			console.log(
 				`[signal] blocked message from ${parsed.number} (not in allowlist)`,
 			);
-			// Optional: send a quick rejection reply
 			if (parsed.timestamp) {
 				pendingReaction = {
 					recipient: parsed.number,
@@ -767,7 +800,6 @@ export default function (pi: ExtensionAPI) {
 
 		const body = parsed.body.trim();
 
-		// Check for commands
 		if (body.startsWith("/")) {
 			const parts = body.slice(1).split(/\s+/);
 			const cmd = parts[0].toLowerCase();
@@ -778,7 +810,6 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// Normal message — forward to agent, unless paused via /pause.
 		if (paused) {
 			sendToSignal(parsed.number, "⏸ Paused. Send /resume to re-enable.").catch(
 				() => {},
@@ -788,249 +819,124 @@ export default function (pi: ExtensionAPI) {
 		forwardToAgent(parsed);
 	}
 
-	// ── Daemon JSON-RPC helpers ──────────────────────────────────────
-
-	/** Call the signal-cli daemon JSON-RPC API. */
-	async function daemonRpc(
-		method: string,
-		params: Record<string, unknown>,
-	): Promise<{ ok: boolean; result?: unknown; error?: unknown }> {
-		const payload = JSON.stringify({
-			jsonrpc: "2.0",
-			method,
-			params,
-			id: Date.now(),
-		});
-		const result = await pi.exec(
-			"curl",
-			[
-				"-s",
-				"-f",
-				"-X",
-				"POST",
-				`${SIGNAL_DAEMON_URL}/api/v1/rpc`,
-				"-H",
-				"Content-Type: application/json",
-				"-d",
-				payload,
-				"--max-time",
-				"15",
-			],
-			{ timeout: 20_000 },
-		);
-		if (result.code !== 0) return { ok: false };
-		try {
-			const json = JSON.parse(result.stdout);
-			if (json.error) return { ok: false, error: json.error };
-			return { ok: true, result: json.result };
-		} catch {
-			return { ok: false };
-		}
-	}
-
-	/** Send an emoji reaction to a Signal message. */
-	async function sendReaction(
-		destination: string,
-		targetAuthor: string,
-		timestamp: number,
-		emoji: string,
-	): Promise<boolean> {
-		if (!PI_SIGNAL_ACCOUNT) return false;
-
-		// Use JSON-RPC API (CLI deadlocks on config lock held by daemon)
-		const res = await daemonRpc("sendReaction", {
-			recipient: destination,
-			targetAuthor: targetAuthor,
-			targetTimestamp: timestamp,
-			emoji,
-		});
-		return res.ok;
-	}
-
-	/** Remove all reactions from a Signal message. */
-	async function removeReaction(
-		destination: string,
-		targetAuthor: string,
-		timestamp: number,
-	): Promise<boolean> {
-		if (!PI_SIGNAL_ACCOUNT) return false;
-
-		// Use JSON-RPC API with remove flag
-		const res = await daemonRpc("sendReaction", {
-			recipient: destination,
-			targetAuthor: targetAuthor,
-			targetTimestamp: timestamp,
-			emoji: "\u200b", // empty marker — remove=true handles it
-			remove: true,
-		});
-		return res.ok;
-	}
-
-	// ── SSE Listener (in-memory, no log file) ─────────────────────────
+	// ── WebSocket Listener (for json-rpc-native mode) ───────────────
 
 	/**
-	 * Connect to the signal-cli daemon's SSE endpoint and stream incoming
-	 * messages in-memory.  Reconnects automatically with exponential backoff
-	 * on connection drops — mirrors hermes-agent's _sse_listener pattern.
-	 *
-	 * No log file is written — all message processing happens in-memory
-	 * for better security.
+	 * Connect to the bbernhard REST API WebSocket endpoint for receiving
+	 * messages. In json-rpc-native mode, /v1/receive/{number} is a WebSocket.
+	 * Format: { account, envelope: { source, sourceNumber, dataMessage, ... } }
 	 */
-	function startSSEListener(): void {
-		// Skip if not the primary instance
+	function startWebSocketListener(): void {
 		if (!PI_SIGNAL_PRIMARY) {
 			console.log(
-				"[signal] PI_SIGNAL_PRIMARY is not set — skipping SSE listener (another instance handles it).",
+				"[signal] PI_SIGNAL_PRIMARY is not set — skipping WebSocket listener.",
 			);
 			return;
 		}
 
 		if (!PI_SIGNAL_ACCOUNT) {
-			console.warn("[signal] PI_SIGNAL_ACCOUNT is not set — cannot start SSE listener.");
+			console.warn("[signal] PI_SIGNAL_ACCOUNT is not set — cannot start WebSocket listener.");
 			return;
 		}
 
-		doConnect();
+		doWebSocketConnect();
 	}
 
-	function doConnect() {
-		// Clean up any existing connection
-		cleanupSSE();
+	function doWebSocketConnect() {
+		cleanupWebSocket();
 
-		const daemonUrl = new URL(SIGNAL_DAEMON_URL);
-		const ssePath = `/api/v1/events?account=${encodeURIComponent(PI_SIGNAL_ACCOUNT)}`;
+		const baseUrl = new URL(SIGNAL_DAEMON_URL);
+		const wsPath = `/v1/receive/${encodeURIComponent(PI_SIGNAL_ACCOUNT)}?timeout=30`;
 
-		console.log(`[signal] connecting SSE to ${SIGNAL_DAEMON_URL}${ssePath}`);
+		const isHttps = baseUrl.protocol === "https:";
+		const lib = isHttps ? https : http;
 
-		const req = http.get(
-			{
-				hostname: daemonUrl.hostname,
-				port: daemonUrl.port || 8080,
-				path: ssePath,
-				timeout: 0, // no timeout — stream stays open
-			},
-			(res) => {
-				const statusCode = res.statusCode || 0;
+		const protocol = isHttps ? "wss://" : "ws://";
+		const wsUrl = `${protocol}${baseUrl.hostname}:${baseUrl.port || 80}${wsPath}`;
 
-				if (statusCode !== 200) {
-					console.error(`[signal] SSE connection failed with status ${statusCode}`);
-					res.resume(); // drain the response
-					scheduleReconnect();
-					return;
+		console.log(`[signal] connecting WebSocket to ${wsUrl}`);
+
+		try {
+			const ws = new WebSocket(wsUrl);
+
+			ws.onopen = () => {
+				console.log("[signal] WebSocket connected — listening for incoming messages");
+				wsConnected = true;
+				wsReconnectDelay = SSE_RETRY_DELAY_INITIAL;
+			};
+
+			ws.onmessage = (event: MessageEvent) => {
+				const data = typeof event.data === "string" ? event.data : event.data.toString("utf8");
+				if (!data.trim()) return;
+
+				const parsed = parseEnvelope(data);
+				if (parsed) {
+					injectMessage(parsed);
 				}
+			};
 
-				console.log("[signal] SSE connected — listening for incoming messages");
-				sseConnected = true;
-				sseReconnectDelay = SSE_RETRY_DELAY_INITIAL; // reset backoff
+			ws.onerror = (err: Event) => {
+				console.error("[signal] WebSocket error:", err);
+				wsConnected = false;
+			};
 
-				let buffer = "";
+			ws.onclose = (event: CloseEvent) => {
+				console.log(`[signal] WebSocket closed (code: ${event.code})`);
+				wsConnected = false;
+				scheduleWsReconnect();
+			};
 
-				res.on("data", (chunk: Buffer) => {
-					buffer += chunk.toString("utf8");
-
-					// Process complete lines from the buffer
-					const lines = buffer.split("\n");
-					buffer = lines.pop() || ""; // keep incomplete line in buffer
-
-					for (const line of lines) {
-						const trimmed = line.trim();
-						if (!trimmed) continue;
-						if (trimmed.startsWith(":")) continue; // SSE comment
-
-						// Parse SSE "data:" prefix
-						if (trimmed.startsWith("data:")) {
-							const data = trimmed.slice(5).trim();
-							if (!data) continue;
-
-							const parsed = parseEnvelope(data);
-							if (parsed) injectMessage(parsed);
-						}
-					}
-				});
-
-				res.on("end", () => {
-					console.log("[signal] SSE stream ended");
-					sseConnected = false;
-					scheduleReconnect();
-				});
-
-				res.on("error", (err) => {
-					console.error("[signal] SSE stream error:", err.message);
-					sseConnected = false;
-					scheduleReconnect();
-				});
-			},
-		);
-
-		req.on("error", (err) => {
-			console.error(`[signal] SSE connection error: ${err.message}`);
-			sseConnected = false;
-			scheduleReconnect();
-		});
-
-		req.setTimeout(0); // no timeout
-
-		sseRequest = req;
+			// Store the WebSocket for cleanup
+			(ws as any).__cleanup = ws.close.bind(ws);
+			(globalThis as any).__signalWs = ws;
+		} catch (err) {
+			console.error(`[signal] WebSocket connection error: ${(err as Error).message}`);
+			wsConnected = false;
+			scheduleWsReconnect();
+		}
 	}
 
-	function scheduleReconnect() {
-		if (sseReconnectTimer) return; // already scheduled
+	function scheduleWsReconnect() {
+		if (wsReconnectTimer) return;
 
-		const delay = sseReconnectDelay;
-		console.log(`[signal] reconnecting SSE in ${delay}ms`);
+		const delay = wsReconnectDelay;
+		console.log(`[signal] reconnecting WebSocket in ${delay}ms`);
 
-		sseReconnectTimer = setTimeout(() => {
-			sseReconnectTimer = null;
-			// Exponential backoff, capped at max
-			sseReconnectDelay = Math.min(
-				sseReconnectDelay * 2,
+		wsReconnectTimer = setTimeout(() => {
+			wsReconnectTimer = null;
+			wsReconnectDelay = Math.min(
+				wsReconnectDelay * 2,
 				SSE_RETRY_DELAY_MAX,
 			);
-			doConnect();
+			doWebSocketConnect();
 		}, delay);
 	}
 
-	function cleanupSSE() {
-		if (sseReconnectTimer) {
-			clearTimeout(sseReconnectTimer);
-			sseReconnectTimer = null;
+	function cleanupWebSocket() {
+		if (wsReconnectTimer) {
+			clearTimeout(wsReconnectTimer);
+			wsReconnectTimer = null;
 		}
-		if (sseRequest) {
-			sseRequest.destroy();
-			sseRequest = null;
+		const ws = (globalThis as any).__signalWs;
+		if (ws && typeof ws.close === "function") {
+			try { ws.close(); } catch {}
 		}
-		sseConnected = false;
+		(globalThis as any).__signalWs = null;
+		wsConnected = false;
 	}
 
 	// ── Account ID resolution ──────────────────────────────────────
 
 	/**
-	 * Resolve our own phone number (PI_SIGNAL_ACCOUNT) to a Signal UUID
-	 * by calling the listContacts RPC.  Using the UUID (ACI) rather than
-	 * the raw phone number in the `recipient` array is the key to getting
-	 * signal-cli's `sendSelfMessage()` path to fire, which produces grey
-	 * (synced) bubbles instead of blue (outgoing) ones.
-	 *
-	 * This mirrors what hermes-agent does:
-	 * https://github.com/NousResearch/hermes-agent/blob/main/gateway/platforms/signal.py
+	 * Resolve our own phone number to a Signal UUID by calling the contacts endpoint.
 	 */
 	async function resolveAccountId(): Promise<string | null> {
 		if (!PI_SIGNAL_ACCOUNT) return null;
 
-		const res = await daemonRpc("listContacts", {
-			account: PI_SIGNAL_ACCOUNT,
-			allRecipients: true,
-		});
-		if (!res.ok || !Array.isArray(res.result)) {
-			console.log("[signal] listContacts failed — falling back to phone number");
-			return null;
-		}
-
-		const contacts = res.result as Array<Record<string, unknown>>;
+		const contacts = await listContacts();
 		for (const contact of contacts) {
-			const number = contact.number as string | undefined;
+			const number = (contact.number as string) || "";
 			if (number && number === PI_SIGNAL_ACCOUNT) {
-				// Try uuid first, then aci (older signal-cli uses "uuid")
 				const uuid = (contact.uuid as string) || (contact.aci as string) || null;
 				if (uuid) {
 					console.log(`[signal] resolved account UUID: ${uuid}`);
@@ -1039,38 +945,16 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
-		console.log("[signal] account not found in contacts — falling back to phone number");
+		console.log("[signal] account not found in contacts — using phone number");
 		return null;
 	}
 
 	// ── Send response back to Signal ──────────────────────────────
 
 	/**
-	 * Send a text message back to Signal via the daemon JSON-RPC API.
-	 * Used for auto-replying with the agent's response.
-	 *
-	 * Color note (Note-to-Self): to make replies show up **grey** (as if
-	 * synced from another linked device) we send with `recipient` set to
-	 * the account number and let signal-cli's own self-detection route the
-	 * message through `SendHelper.sendSelfMessage()`. That method wraps the
-	 * message in a `SentTranscriptMessage` and delivers it as a
-	 * `SignalServiceSyncMessage`, which the phone app renders as grey.
-	 *
-	 * Do NOT use `noteToSelf` — it bypasses the `sendSelfMessage()` path on
-	 * some signal-cli versions and falls through to a normal outgoing
-	 * dataMessage, which renders **blue** (as if you typed it).
-	 *
-	 * Do NOT use `notifySelf: true` — that also forces the outgoing
-	 * dataMessage path (blue).
-	 *
-	 * Prerequisite: the Signal phone app must be a separate linked device
-	 * from the daemon (multi-device). If you only have one device,
-	 * `sendSelfMessage` in signal-cli's SendHelper is a no-op
-	 * (`!account.isMultiDevice()` guard) and the message will fall through
-	 * to the normal outgoing path (blue).
-	 *
-	 * This approach matches what hermes-agent does (see
-	 * https://github.com/NousResearch/hermes-agent/blob/main/gateway/platforms/signal.py).
+	 * Send a text message back to Signal via the REST API.
+	 * For self-messages (Note-to-Self), use the resolved UUID so the message
+	 * routes through sendSelfMessage → grey (synced) rendering.
 	 */
 	async function sendToSignal(
 		_recipient: string,
@@ -1078,7 +962,6 @@ export default function (pi: ExtensionAPI) {
 	): Promise<boolean> {
 		if (!message || !message.trim()) return false;
 
-		// Truncate very long messages (Signal limit is ~8000 chars)
 		const maxLen = 7800;
 		let text = message.trim();
 		if (text.length > maxLen) {
@@ -1087,45 +970,19 @@ export default function (pi: ExtensionAPI) {
 				"\n\n[truncated — response too long for Signal]";
 		}
 
-		// Use the resolved UUID (if available) so signal-cli's self-detection
-		// kicks in and routes through sendSelfMessage → grey (synced) rendering.
-		// Include the `account` parameter as signal-cli needs it to know which
-		// linked device to act as.
 		const targetId = resolvedAccountId || PI_SIGNAL_ACCOUNT;
-		const res = await daemonRpc("send", {
-			account: PI_SIGNAL_ACCOUNT,
-			recipient: [targetId],
-			message: text,
-		});
-		return res.ok;
+		const ok = await sendMessage(targetId, text);
+		return ok;
 	}
 
 	// ── Lifecycle ─────────────────────────────────────────────────────
 
 	pi.on("session_start", async (_event: unknown, ctx: unknown) => {
-		// Store context for command handlers
 		extCtx = ctx as ExtensionContext | null;
 
-		// Resolve our phone number to a Signal UUID so outgoing messages
-		// use the recipient-based sync path (grey bubbles instead of blue).
 		resolvedAccountId = await resolveAccountId();
 
-		// Start the SSE listener for incoming messages (in-memory)
-		startSSEListener();
-
-		// Notify if the systemd service is not running
-		const result = await pi.exec("systemctl", [
-			"is-active",
-			"signal-receive.service",
-		]);
-		if (result.code !== 0) {
-			if (ctx && typeof ctx === "object" && "ui" in ctx) {
-				(ctx as Record<string, unknown>).ui?.notify?.(
-					"signal-receive.service is not running. Run /signal-start to start it, or see /signal-setup.",
-					"warning",
-				);
-			}
-		}
+		startWebSocketListener();
 	});
 
 	// Auto-send agent responses back to Signal, with stats footer
@@ -1136,7 +993,6 @@ export default function (pi: ExtensionAPI) {
 		currentSignalSender = null;
 
 		try {
-			// Extract assistant messages from this turn
 			const messages =
 				(event as { messages?: Array<{ role?: string; content?: unknown }> })
 					.messages ?? [];
@@ -1144,7 +1000,6 @@ export default function (pi: ExtensionAPI) {
 
 			if (assistantMessages.length === 0) return;
 
-			// Combine all assistant text content
 			const textParts: string[] = [];
 			for (const msg of assistantMessages) {
 				const content = msg.content;
@@ -1167,7 +1022,6 @@ export default function (pi: ExtensionAPI) {
 			let fullText = textParts.join("\n").trim();
 			if (!fullText) return;
 
-			// Append stats footer if enabled
 			if (statsMode !== "off") {
 				const statsFooter = buildStatsFooter(ctx as ExtensionContext | null);
 				if (statsFooter) {
@@ -1175,13 +1029,11 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			// Remember the exact text sent so /resend can replay it.
 			lastAgentReply = fullText;
 
 			const ok = await sendToSignal(sender.number, fullText);
 			if (ok) {
 				console.log(`[signal] auto-reply sent to ${sender.number}`);
-				// Swap 👀 → ✅
 				if (sender.timestamp) {
 					await removeReaction(sender.number, sender.number, sender.timestamp);
 					await sendReaction(
@@ -1218,7 +1070,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
-		cleanupSSE();
+		cleanupWebSocket();
 	});
 
 	// ── Tool: signal_send ──────────────────────────────────────────
@@ -1231,7 +1083,7 @@ export default function (pi: ExtensionAPI) {
 			"Recipient must be a phone number in E.164 format, e.g. +1234567890. " +
 			"To send to someone by name, first resolve their number with " +
 			"signal_list_contacts, then call this with that number. " +
-			"Uses the signal-cli daemon JSON-RPC API.",
+			"Uses the bbernhard/signal-cli-rest-api REST API.",
 		parameters: Type.Object({
 			recipient: Type.String({
 				description:
@@ -1251,31 +1103,20 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			// Allowlist check: reject recipients not in the allowlist (self always allowed).
 			if (!isAllowedNumber(cleaned)) {
 				throw new Error(
 					`Recipient ${cleaned} is not in the Signal allowlist. Only messages to allowed numbers can be sent.`,
 				);
 			}
 
-			// For self-recipient (Note-to-Self), use the resolved UUID so
-			// signal-cli routes through sendSelfMessage → grey (synced)
-			// rendering. Always include `account` — signal-cli needs it to
-			// identify which linked device to act as.
 			const isSelf = cleaned === PI_SIGNAL_ACCOUNT;
 			const targetId = isSelf && resolvedAccountId ? resolvedAccountId : cleaned;
-			const res = await daemonRpc("send", {
-				account: PI_SIGNAL_ACCOUNT,
-				recipient: [targetId],
-				message: params.message,
-			});
-			if (!res.ok) {
-				throw new Error(
-					`Signal daemon send failed: ${JSON.stringify(res.error || "unknown error")}`,
-				);
+			const ok = await sendMessage(targetId, params.message);
+
+			if (!ok) {
+				throw new Error(`Failed to send Signal message.`);
 			}
 
-			// Update reaction: 👀 → ✅
 			if (pendingReaction) {
 				const pr = pendingReaction;
 				pendingReaction = null;
@@ -1291,11 +1132,6 @@ export default function (pi: ExtensionAPI) {
 					.catch(() => {});
 			}
 
-			// Only suppress the agent_end auto-reply when the tool already
-			// delivered to SELF (Note-to-Self) — otherwise the two would
-			// duplicate. For a send to a DIFFERENT number, keep the context so
-			// agent_end delivers the agent's natural confirmation
-			// ("I've sent … to +1555…") back to Note-to-Self.
 			if (cleaned === PI_SIGNAL_ACCOUNT) {
 				currentSignalSender = null;
 			}
@@ -1316,8 +1152,8 @@ export default function (pi: ExtensionAPI) {
 		name: "signal_status",
 		label: "Signal Status",
 		description:
-			"Check whether signal-cli is installed, the daemon is running, " +
-			"and the SSE stream is connected.",
+			"Check whether the bbernhard/signal-cli-rest-api is running, " +
+			"and the WebSocket connection is established.",
 		parameters: Type.Object({}),
 		async execute(
 			_toolCallId: string,
@@ -1328,24 +1164,13 @@ export default function (pi: ExtensionAPI) {
 
 			lines.push(`Account: ${PI_SIGNAL_ACCOUNT || "(not set)"}`);
 
-			// Check signal-cli binary
-			const cli = await pi.exec("which", ["signal-cli"], { timeout: 5_000 });
+			// Check REST API connectivity
+			const about = await getApiAbout();
 			lines.push(
-				`signal-cli binary: ${cli.code === 0 ? `✓ ${cli.stdout.trim()}` : "✗ NOT installed"}`,
+				`REST API (${SIGNAL_DAEMON_URL}): ${about.ok ? `✓ v${about.version || "?"}` : "✗ not reachable"}`,
 			);
 
-			// Check daemon HTTP API
-			if (SIGNAL_DAEMON_URL) {
-				const daemon = await daemonRpc("version", {});
-				lines.push(
-					`daemon API (${SIGNAL_DAEMON_URL}): ${daemon.ok ? `✓ v${(daemon.result as { version?: string })?.version || "?"}` : "✗ not reachable"}`,
-				);
-			}
-
-			// Check SSE stream status (in-memory, no log file)
-			lines.push(`SSE stream: ${sseConnected ? "✓ connected" : "✗ disconnected"}`);
-
-			// Add stats mode info
+			lines.push(`WebSocket: ${wsConnected ? "✓ connected" : "✗ disconnected"}`);
 			lines.push(`Stats mode: ${statsMode}`);
 
 			return {
@@ -1381,21 +1206,11 @@ export default function (pi: ExtensionAPI) {
 			params: { query?: string },
 			_signal?: AbortSignal,
 		) {
-			const res = await daemonRpc("listContacts", {
-				account: PI_SIGNAL_ACCOUNT,
-				allRecipients: true,
-			});
-			if (!res.ok || !Array.isArray(res.result)) {
-				throw new Error(
-					`Could not list contacts: ${JSON.stringify(res.error || "unknown error")}`,
-				);
-			}
+			const contacts = await listContacts();
 
-			const contacts = (res.result as Array<Record<string, unknown>>)
+			const contactList = contacts
 				.map((c) => {
 					const number = (c.number as string) || "";
-					// The display name lives under different fields depending on the
-					// signal-cli version — take the first one present.
 					const name =
 						(c.name as string) ||
 						(c.profileName as string) ||
@@ -1405,22 +1220,18 @@ export default function (pi: ExtensionAPI) {
 							.trim() ||
 						(c.username as string) ||
 						"";
-					// Names/usernames are third-party controlled — sanitize before
-					// they reach the agent's context (prompt-injection defense).
 					return { name: sanitizeContactName(name), number };
 				})
-				// Drop numberless contacts (can't be sent via signal_send) and self.
 				.filter((c) => c.number && c.number !== PI_SIGNAL_ACCOUNT);
 
 			const q = params.query?.toLowerCase().trim();
 			const filtered = q
-				? contacts.filter(
+				? contactList.filter(
 						(c) =>
 							c.name.toLowerCase().includes(q) || c.number.includes(q),
 					)
-				: contacts;
+				: contactList;
 
-			// Named contacts first, then alphabetical by name.
 			filtered.sort(
 				(a, b) =>
 					(a.name ? 0 : 1) - (b.name ? 0 : 1) || a.name.localeCompare(b.name),
@@ -1520,66 +1331,6 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("signal-restart", {
-		description:
-			"Restart the Signal message-receive systemd service (start + stop in one step)",
-		async handler(_args: string, ctx: unknown) {
-			const extensionCtx = ctx as {
-				ui?: { notify: (msg: string, level: string) => void };
-			};
-
-			const result = await pi.exec(
-				"sudo",
-				["systemctl", "restart", "signal-receive.service"],
-				{ timeout: 20_000 },
-			);
-			if (result.code === 0) {
-				extensionCtx.ui?.notify?.("signal-receive.service restarted.", "info");
-			} else {
-				extensionCtx.ui?.notify?.(
-					`Failed to restart service: ${result.stderr || result.stdout}`,
-					"error",
-				);
-			}
-		},
-	});
-
-	pi.registerCommand("signal-logs", {
-		description:
-			"Show recent signal-receive service logs. Usage: /signal-logs [lines] (default 50)",
-		async handler(args: string, ctx: unknown) {
-			const extensionCtx = ctx as {
-				ui?: { notify: (msg: string, level: string) => void };
-			};
-
-			// Clamp to a sane range; default 50.
-			const parsed = parseInt(args.trim(), 10);
-			const n = Math.max(1, Math.min(500, Number.isNaN(parsed) ? 50 : parsed));
-
-			// No sudo: pi.exec runs without a TTY, so a sudo password prompt
-			// would stall until timeout. Reading a system unit's journal works
-			// without sudo for users in the systemd-journal/adm group; if it
-			// fails, we tell the user the sudo command to run themselves.
-			const result = await pi.exec(
-				"journalctl",
-				["-u", "signal-receive", "-n", String(n), "--no-pager"],
-				{ timeout: 10_000 },
-			);
-			if (result.code === 0) {
-				extensionCtx.ui?.notify?.(
-					result.stdout.trim() || "(no log output)",
-					"info",
-				);
-			} else {
-				extensionCtx.ui?.notify?.(
-					`Could not read logs (${result.stderr?.trim() || "permission denied?"}). ` +
-						`Try: sudo journalctl -u signal-receive -n ${n}`,
-					"error",
-				);
-			}
-		},
-	});
-
 	pi.registerCommand("signal-send", {
 		description:
 			"Send a Signal message from the TUI. Usage: /signal-send <+E164> <message>",
@@ -1613,7 +1364,6 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Allowlist check: reject recipients not in the allowlist (self always allowed).
 			if (!isAllowedNumber(cleaned)) {
 				extensionCtx.ui?.notify?.(
 					`⛔ ${cleaned} is not in the Signal allowlist. Only messages to allowed numbers can be sent.`,
@@ -1622,20 +1372,15 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// For self-recipient, use the resolved UUID so signal-cli routes
-			// through sendSelfMessage → grey (synced) rendering.
 			const isSelf = cleaned === PI_SIGNAL_ACCOUNT;
 			const targetId = isSelf && resolvedAccountId ? resolvedAccountId : cleaned;
-			const res = await daemonRpc("send", {
-				account: PI_SIGNAL_ACCOUNT,
-				recipient: [targetId],
-				message,
-			});
+			const ok = await sendMessage(targetId, message);
+
 			extensionCtx.ui?.notify?.(
-				res.ok
+				ok
 					? `Message sent to ${cleaned}.`
-					: `Send failed: ${JSON.stringify(res.error || "unknown error")}`,
-				res.ok ? "info" : "error",
+					: `Send failed.`,
+				ok ? "info" : "error",
 			);
 		},
 	});
@@ -1658,81 +1403,23 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("signal-start", {
-		description:
-			"Start the Signal message-receive systemd service",
-		async handler(_args: string, ctx: unknown) {
-			const extensionCtx = ctx as {
-				ui?: { notify: (msg: string, level: string) => void };
-			};
-
-			const result = await pi.exec(
-				"sudo",
-				["systemctl", "start", "signal-receive.service"],
-				{ timeout: 15_000 },
-			);
-			if (result.code === 0) {
-				extensionCtx.ui?.notify?.("signal-receive.service started.", "info");
-			} else {
-				extensionCtx.ui?.notify?.(
-					`Failed to start service: ${result.stderr || result.stdout}`,
-					"error",
-				);
-			}
-		},
-	});
-
-	pi.registerCommand("signal-stop", {
-		description:
-			"⚠️ Stop the Signal message-receive systemd service. " +
-			"WARNING: pi will no longer receive incoming Signal messages until /signal-start is run.",
-		async handler(_args: string, ctx: unknown) {
-			const extensionCtx = ctx as {
-				ui?: { notify: (msg: string, level: string) => void };
-			};
-
-			const result = await pi.exec(
-				"sudo",
-				["systemctl", "stop", "signal-receive.service"],
-				{ timeout: 15_000 },
-			);
-			if (result.code === 0) {
-				extensionCtx.ui?.notify?.(
-					"⚠️ signal-receive.service stopped. pi will not receive Signal messages until /signal-start is run.",
-					"warning",
-				);
-			} else {
-				extensionCtx.ui?.notify?.(
-					`Failed to stop service: ${result.stderr || result.stdout}`,
-					"error",
-				);
-			}
-		},
-	});
-
 	pi.registerCommand("signal-status", {
 		description:
-			"Show Signal integration status (account, service health, stats mode)",
+			"Show Signal integration status (account, API health, connection state)",
 		async handler(_args: string, ctx: unknown) {
 			const extensionCtx = ctx as {
 				ui?: { notify: (msg: string, level: string) => void };
 			};
 			const statusLines: string[] = [];
 
-			const cli = await pi.exec("which", ["signal-cli"], { timeout: 5_000 });
-			statusLines.push(
-				`signal-cli: ${cli.code === 0 ? "✓ " + cli.stdout.trim() : "✗ NOT installed"}`,
-			);
-
 			if (SIGNAL_DAEMON_URL) {
-				const daemon = await daemonRpc("version", {});
+				const about = await getApiAbout();
 				statusLines.push(
-					`daemon API (${SIGNAL_DAEMON_URL}): ${daemon.ok ? `✓ v${(daemon.result as { version?: string })?.version || "?"}` : "✗ not reachable"}`,
+					`REST API (${SIGNAL_DAEMON_URL}): ${about.ok ? `✓ v${about.version || "?"}` : "✗ not reachable"}`,
 				);
 			}
 
-			statusLines.push(`SSE stream: ${sseConnected ? "✓ connected" : "✗ disconnected"}`);
-
+			statusLines.push(`WebSocket: ${wsConnected ? "✓ connected" : "✗ disconnected"}`);
 			statusLines.push(`Stats mode: ${statsMode}`);
 
 			const msg = [
@@ -1745,61 +1432,14 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ── Setup helpers ──────────────────────────────────────────────────
-
 	async function setupNativeMode(ctx: {
 		notify?: (msg: string, level: string) => void;
 		confirm?: (title: string, msg: string) => Promise<boolean>;
 	}): Promise<void> {
-		// pi's extension `exec` runs commands with stdin ignored (no TTY), so
-		// this command cannot itself run setup.sh — it needs a sudo password
-		// prompt and a blocking QR-link step. Instead, run pre-flight checks
-		// here and hand the user the exact command to run in a real terminal,
-		// resolved to wherever this package is actually installed (no need to
-		// clone the repo separately).
-
-		// Step 1: Check Java 25+
-		const javaCheck = await pi.exec("java", ["-version"], { timeout: 5_000 });
-		if (javaCheck.code !== 0) {
-			ctx.notify?.(
-				"Java 25+ is required. Install it: https://adoptium.net/",
-				"error",
-			);
-		} else {
-			ctx.notify?.("✓ Java is installed", "info");
-		}
-
-		// Step 2: Check signal-cli
-		const cliCheck = await pi.exec("which", ["signal-cli"], { timeout: 5_000 });
-		if (cliCheck.code !== 0) {
-			ctx.notify?.(
-				"signal-cli not found — setup.sh will guide you through installing it.",
-				"info",
-			);
-		} else {
-			ctx.notify?.(
-				`✓ signal-cli is installed: ${cliCheck.stdout.trim()}`,
-				"info",
-			);
-		}
-
-		// Step 3: Check systemd service status (informational only)
-		const svcStatus = await pi.exec(
-			"systemctl",
-			["is-active", "signal-receive.service"],
-			{ timeout: 5_000 },
-		);
-		if (svcStatus.code === 0) {
-			ctx.notify?.("✓ signal-receive.service is already running", "info");
-		} else {
-			ctx.notify?.("signal-receive.service is not set up yet.", "info");
-		}
-
-		// Step 4: Hand off to the deterministic installer. This needs a real
-		// terminal (sudo password, interactive QR link) that pi cannot provide.
+		// In REST API mode, setup is just ensuring the Docker container is running
 		ctx.notify?.(
-			`Run this in a terminal to finish setup (link device + create service):\n\n` +
-				`  bash ${SETUP_SCRIPT_PATH}\n`,
+			"In REST API mode, Signal integration uses the bbernhard/signal-cli-rest-api " +
+			"Docker container. Ensure it's running on " + SIGNAL_DAEMON_URL + ".",
 			"info",
 		);
 	}
