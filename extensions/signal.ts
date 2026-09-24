@@ -6,12 +6,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import * as http from "node:http";
 import * as https from "node:https";
-import * as path from "node:path";
 
 // ── Configuration ─────────────────────────────────────────────────────
-
-const PACKAGE_ROOT = path.resolve(__dirname, "..");
-const SETUP_SCRIPT_PATH = path.join(PACKAGE_ROOT, "scripts", "setup.sh");
 
 const PI_SIGNAL_ACCOUNT = process.env.PI_SIGNAL_ACCOUNT || "";
 
@@ -71,9 +67,9 @@ const DEFAULT_STATS_MODE = (
 	process.env.PI_SIGNAL_STATS || "short"
 ).toLowerCase();
 
-// SSE reconnect backoff (kept for compatibility with status reporting)
-const SSE_RETRY_DELAY_INITIAL = 2000;
-const SSE_RETRY_DELAY_MAX = 60_000;
+// WebSocket reconnect backoff
+const WS_RETRY_DELAY_INITIAL = 2000;
+const WS_RETRY_DELAY_MAX = 60_000;
 
 // ── REST API helper ───────────────────────────────────────────────────
 
@@ -220,10 +216,10 @@ async function getApiAbout(): Promise<{ ok: boolean; version?: string }> {
 // ── Extension ──────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	// WebSocket / SSE state (WebSocket for json-rpc-native mode)
+	// WebSocket state (incoming messages via the bbernhard REST API)
 	let wsConnected = false;
 	let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
-	let wsReconnectDelay = SSE_RETRY_DELAY_INITIAL;
+	let wsReconnectDelay = WS_RETRY_DELAY_INITIAL;
 
 	// Resolved Signal UUID (ACI) for our own account
 	let resolvedAccountId: string | null = null;
@@ -922,7 +918,7 @@ export default function (pi: ExtensionAPI) {
 			ws.onopen = () => {
 				debug("[signal] WebSocket connected — listening for incoming messages");
 				wsConnected = true;
-				wsReconnectDelay = SSE_RETRY_DELAY_INITIAL;
+				wsReconnectDelay = WS_RETRY_DELAY_INITIAL;
 			};
 
 			ws.onmessage = (event: MessageEvent) => {
@@ -970,7 +966,7 @@ export default function (pi: ExtensionAPI) {
 			wsReconnectTimer = null;
 			wsReconnectDelay = Math.min(
 				wsReconnectDelay * 2,
-				SSE_RETRY_DELAY_MAX,
+				WS_RETRY_DELAY_MAX,
 			);
 			doWebSocketConnect();
 		}, delay);

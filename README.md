@@ -2,16 +2,16 @@
 
 Connect [pi](https://pi.dev) to [Signal Messenger](https://signal.org/) for two-way messaging. Send a **Note-to-Self** message from your phone → pi receives it, the LLM processes it, and pi replies back automatically.
 
-> **Only Note-to-Self messages are processed.** Messages from other senders are silently ignored for security.
+> **By default, only your own number is allowed.** Note-to-Self messages are always processed; messages from other numbers are only accepted if that number is in `PI_SIGNAL_ALLOWLIST`. Non-allowlisted senders get a 🚫 reaction and a short rejection reply, and sends to them are blocked.
 
 ## How It Works
 
 ```
-Phone (Note-to-Self) → signal-cli daemon (SSE in-memory) → pi extension
+Phone (Note-to-Self) → bbernhard/signal-cli-rest-api (Docker, REST + WebSocket) → pi extension
     → 👀 reaction → LLM processes → auto-reply → ✅ reaction
 ```
 
-The extension connects directly to the signal-cli daemon's SSE endpoint over HTTP — **no log file on disk** (messages are streamed in-memory).
+The extension talks to the [bbernhard/signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) container over REST (send, reactions, contacts, health) and a persistent WebSocket on `/v1/receive/{number}` for incoming messages. signal-cli itself runs inside the container — there is no host daemon, no log file, and no systemd unit to manage.
 
 Commands (`/model`, `/abort`, `/clear`, `/stats`, `/status`, `/whoami`, `/resend`, `/pause`, `/resume`, `/help`) are handled locally without LLM. Everything else is forwarded to the LLM.
 
@@ -19,7 +19,7 @@ Commands (`/model`, `/abort`, `/clear`, `/stats`, `/status`, `/whoami`, `/resend
 
 ![pi agent response](docs/img/pi-agent-response-img.png)
 
-You can also send the response to someone else in your contacts using their name or phone number.
+You can also send the response to someone else in your contacts using their name or phone number (the number must be allowlisted — see [Security](#security)).
 
 ![Note-to-Self-Send-to message](docs/img/note-to-self-send-to-img.png)
 
@@ -27,34 +27,34 @@ You can also send the response to someone else in your contacts using their name
 
 ## Installation
 
-**Prerequisites:** [signal-cli](https://github.com/AsamK/signal-cli/) in PATH, Java 25+, Signal app on your phone.
-
-Installation has two separate layers — install the pi package from npm, then provision the
-system daemon that receives Signal messages:
+**Prerequisites:** [Docker](https://www.docker.com/) (or Podman), a Signal app on your phone. Java and signal-cli are not needed on the host — they run inside the container.
 
 ```bash
-# 1. Install the pi package (no clone needed)
+# 1. Install the pi package
 pi install @aalzubidy/pi-signal
 
-# 2. In pi, run the setup wizard command. It checks Java/signal-cli, then prints the
-#    exact `bash .../setup.sh` command to run in a terminal (needs sudo + a phone QR
-#    scan, which pi's command can't do for you — it just locates the script for you).
-/signal-setup
+# 2. Run the signal-cli REST API container (adjust image/port/volume to taste)
+docker run -d --name signal-api --restart unless-stopped \
+  -p 127.0.0.1:8090:8080 \
+  -v signal-api-data:/root/.local/share/signal-cli \
+  bbernhard/signal-cli-rest-api
 
-# 3. Run the command it prints, in a terminal:
-bash /path/it/printed/scripts/setup.sh   # guides you through device linking, systemd service - **you might need to run it as sudo since it creates systemd service file**
+# 3. Link your Signal account (QR scan, as the account you want pi to use)
+docker exec -it signal-api signal-cli -a +1234567890 link
 
-# 4. setup.sh prints these two exports at the end — add them to your shell
-#    config (~/.bashrc, ~/.zshrc, ~/.profile), then restart your shell:
+# 4. Configure pi — add these to your shell config (~/.bashrc, ~/.zshrc, ...):
 export PI_SIGNAL_ACCOUNT=+1234567890   # your Signal number (E.164)
 export PI_SIGNAL_PRIMARY=true          # marks this instance as the one handling Signal
+# Optional — numbers allowed to send/receive with the agent (self is always allowed):
+# export PI_SIGNAL_ALLOWLIST=+15551234567,+441234567890
 
-# 5. Start pi (restart it or run /reload if already running)
+# 5. Start pi (restart it or run /reload if already running), then verify:
 pi
+# /signal-setup  — setup guidance (where the REST API container must be running)
+# /signal-status — shows REST API health + WebSocket state
 ```
 
 Send a Note-to-Self from your phone. pi receives it (👀), processes it, and replies automatically (✅).
-
 
 ## Environment Variables
 
@@ -62,9 +62,9 @@ Send a Note-to-Self from your phone. pi receives it (👀), processes it, and re
 |---|---|---|---|
 | `PI_SIGNAL_ACCOUNT` | Yes | — | Your Signal number in E.164: `+1234567890` |
 | `PI_SIGNAL_PRIMARY` | No | `false` | Set `"true"` on the ONE instance handling Signal messages |
-| `PI_SIGNAL_DAEMON_URL` | No | `http://127.0.0.1:8080` | Daemon URL for JSON-RPC and SSE |
+| `PI_SIGNAL_DAEMON_URL` | No | `http://127.0.0.1:8090` | Base URL of the bbernhard/signal-cli-rest-api container (REST + WebSocket) |
+| `PI_SIGNAL_ALLOWLIST` | No | empty = self only | Comma-separated E.164 numbers allowed to send/receive with the agent. `PI_SIGNAL_ACCOUNT` is always allowed regardless. |
 | `PI_SIGNAL_STATS` | No | `short` | Stats mode: `off`, `short`, or `full` |
-| `PI_SIGNAL_QUIET_DAEMON` | No | `true` | Keep message content out of journalctl (secure default). Set `"false"` to surface daemon output for debugging |
 | `PI_SIGNAL_DEBUG` | No | `false` | Set `"true"` or `"1"` to enable verbose debug logging from the Signal extension |
 
 ## Commands (from Signal)
@@ -82,16 +82,16 @@ Send a Note-to-Self from your phone. pi receives it (👀), processes it, and re
 | `/resume` | Resume processing |
 | `/help` | Show available commands |
 
-> **Send to another number:** just ask the LLM naturally — e.g. *"summarize this and text it to +1555…"*, or by name: *"send this to Mike"*. For a name, the agent resolves it via `signal_list_contacts` first (names only resolve if signal-cli knows them — a synced contact or Signal profile name). The message goes to that number, and the agent's confirmation reply comes back to your Note-to-Self so you can see who it was sent to.
+> **Send to another number:** just ask the LLM naturally — e.g. *"summarize this and text it to +1555…"*, or by name: *"send this to Mike"*. For a name, the agent resolves it via `signal_list_contacts` first (names only resolve if signal-cli knows them — a synced contact or Signal profile name). The target must be in `PI_SIGNAL_ALLOWLIST`, otherwise the send is blocked. The agent's confirmation reply comes back to your Note-to-Self so you can see who it was sent to.
 
 ## TUI Commands (in pi)
 
-`/signal-setup`, `/signal-start`, `/signal-stop`, `/signal-restart`, `/signal-status`, `/signal-logs [n]`, `/signal-send <+E164> <msg>`, `/signal-model`, `/signal-abort`, `/signal-stats`
+`/signal-setup`, `/signal-status`, `/signal-send <+E164> <msg>`, `/signal-model`, `/signal-abort`, `/signal-stats`
 
 ## Tools (LLM-accessible)
 
-- **`signal_send`** — Send a Signal message to a phone number (E.164)
-- **`signal_status`** — Check connection status and health
+- **`signal_send`** — Send a Signal message to a phone number (E.164). Blocked for numbers not in the allowlist.
+- **`signal_status`** — Check connection status and health (REST API reachable, WebSocket connected)
 - **`signal_list_contacts`** — List contacts (name → number) so the agent can resolve a name before sending
 
 ## Multiple Instances
@@ -100,19 +100,21 @@ Set `PI_SIGNAL_PRIMARY=true` on one pi instance. Other instances ignore Signal m
 
 ## Security
 
-- Only **Note-to-Self** messages drive the agent; messages from other senders are ignored.
-- Message content is streamed in-memory (no log file), and by default (`PI_SIGNAL_QUIET_DAEMON=true`) daemon output is kept out of `journalctl`.
+- **Default-deny allowlist:** only your own number is allowed by default. Incoming messages from any other number get a 🚫 reaction and a rejection reply; `signal_send` and `/signal-send` refuse to deliver to non-allowlisted numbers. Add trusted numbers via `PI_SIGNAL_ALLOWLIST`.
+- **No local message logs:** messages flow over a loopback WebSocket; message content is not written to a log file by pi-signal. (The signal-cli data store inside the container holds conversation data — protect the container volume accordingly.)
+- **Unauthenticated REST API on loopback:** the bbernhard container exposes its REST API (default `127.0.0.1:8090`) without an API key by default. It is bound to loopback, but any local process can reach it and could send messages as your account, read contacts, or drive the agent. Run pi-signal only on a **single-trusted-user host** and don't expose the port. (bbernhard optionally supports an API key; this extension does not currently send one.)
 - Third-party contact names from `signal_list_contacts` are sanitized before reaching the agent.
-- The signal-cli daemon on `127.0.0.1:8080` is **unauthenticated** (a signal-cli limitation). It is bound to loopback, but any local process can reach it — so run pi-signal only on a **single-trusted-user host** and don't expose port 8080. See [SKILL.md](skills/signal/SKILL.md#security-model) for details.
 
 ## Troubleshooting
 
 ```bash
-sudo systemctl status signal-receive.service
-sudo journalctl -u signal-receive -f
-curl -s http://127.0.0.1:8080/api/v1/check
-# /signal-status in pi
+docker ps                                # container running?
+docker logs --tail 50 -f signal-api      # container / signal-cli output
+curl -s http://127.0.0.1:8090/v1/about   # REST API reachable?
 ```
+
+- `/signal-status` in pi — shows REST API health and WebSocket state
+- `PI_SIGNAL_DEBUG=true` — verbose extension logging (WebSocket frames, parsing, sends)
 
 See [skills/signal/SKILL.md](skills/signal/SKILL.md) for full troubleshooting.
 
@@ -122,15 +124,14 @@ See [skills/signal/SKILL.md](skills/signal/SKILL.md) for full troubleshooting.
 pi-signal/
 ├── package.json
 ├── README.md
+├── CHANGELOG.md
 ├── LICENSE
 ├── extensions/
-│   └── signal.ts                # Main extension
+│   └── signal.ts                # Main extension (REST + WebSocket)
 ├── skills/
 │   └── signal/SKILL.md          # Full setup & troubleshooting guide
 └── scripts/
-    ├── setup.sh                 # Interactive setup wizard
-    ├── signal-receive-loop.sh   # Native daemon manager
-    └── signal-receive.service   # systemd unit template
+    └── setup.sh                 # Interactive Docker setup wizard (container "signal-api")
 ```
 
 ## License

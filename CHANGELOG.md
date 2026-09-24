@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.0.0
+
+Major release — the integration has moved from the native signal-cli daemon to the bbernhard/signal-cli-rest-api container. Breaking changes: `PI_SIGNAL_DAEMON_URL` default port moved 8080 → 8090, `PI_SIGNAL_QUIET_DAEMON` removed, TUI commands `/signal-start`, `/signal-stop`, `/signal-restart`, `/signal-logs` removed, and setup now requires Docker instead of host Java/signal-cli/systemd.
+
+### Changed
+- **Rewrote the extension to use the bbernhard/signal-cli-rest-api container** (REST for send/reactions/contacts/health + persistent WebSocket on `/v1/receive/{number}` for incoming). Replaces the JSON-RPC + SSE integration with the native signal-cli daemon.
+- **Containerized deployment:** the systemd service (`signal-receive.service`), the native receive-loop script, and the Java/signal-cli-on-host setup helpers are gone. `scripts/setup.sh` is now a Docker/Podman wizard (container `signal-api`, volume `signal-api-data`).
+- Default `PI_SIGNAL_DAEMON_URL` moved from `http://127.0.0.1:8080` to `http://127.0.0.1:8090`.
+- Removed TUI commands `/signal-start`, `/signal-stop`, `/signal-restart`, and `/signal-logs` (no host service to manage). `/signal-status` now reports REST API health and WebSocket state.
+
+### Added
+- **`PI_SIGNAL_ALLOWLIST`** — comma-separated E.164 numbers allowed to send/receive with the agent. Default is self-only (default-deny); non-allowlisted senders get a 🚫 reaction and a rejection reply, and `signal_send`/`/signal-send` refuse non-allowlisted recipients.
+- **`PI_SIGNAL_DEBUG`** — set `true`/`1` for verbose extension logging; when off, only `console.error` output appears.
+
+### Fixed
+- WebSocket messages are parsed in the container's JSON-RPC envelope format.
+- `parseEnvelope` failures are logged at debug level instead of error, and dropped-message logging no longer breaks output.
+
+### Removed
+- `PI_SIGNAL_QUIET_DAEMON` — the daemon no longer runs on the host, so there is no journal output to quiet.
+
 ## 1.1.1
 
 ### Security
