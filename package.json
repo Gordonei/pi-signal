@@ -1,8 +1,10 @@
 {
   "name": "@aalzubidy/pi-signal",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Connect pi to Signal Messenger via native signal-cli daemon",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/aalzubidy/pi-signal.git"
@@ -14,8 +16,12 @@
   "author": "aasystemsllc-aalzubidy",
   "license": "MPL-2.0",
   "pi": {
-    "extensions": ["./extensions"],
-    "skills": ["./skills"]
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
   },
   "files": [
     "extensions",
