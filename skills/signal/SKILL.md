@@ -29,7 +29,7 @@ separate steps — the package ships `scripts/setup.sh` inside it, so no `git cl
 
 ```bash
 # 1. Install the pi package
-pi install @aalzubidy/pi-signal
+pi install @gordoneiza/pi-signal
 ```
 
 Restart pi or run `/reload`.

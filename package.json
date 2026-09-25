@@ -1,5 +1,5 @@
 {
-  "name": "@aalzubidy/pi-signal",
+  "name": "@gordoneiza/pi-signal",
   "version": "2.0.0",
   "description": "Connect pi to Signal Messenger via the bbernhard/signal-cli-rest-api container (REST + WebSocket)",
   "keywords": [
@@ -7,13 +7,13 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/aalzubidy/pi-signal.git"
+    "url": "git+https://github.com/gordoneiza/pi-signal.git"
   },
-  "homepage": "https://github.com/aalzubidy/pi-signal#readme",
+  "homepage": "https://github.com/gordoneiza/pi-signal#readme",
   "bugs": {
-    "url": "https://github.com/aalzubidy/pi-signal/issues"
+    "url": "https://github.com/gordoneiza/pi-signal/issues"
   },
-  "author": "aasystemsllc-aalzubidy",
+  "author": "gordoneiza and aalzubidy",
   "license": "MPL-2.0",
   "pi": {
     "extensions": [

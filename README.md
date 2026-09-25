@@ -1,4 +1,4 @@
-# @aalzubidy/pi-signal
+# @gordoneiza/pi-signal
 
 Connect [pi](https://pi.dev) to [Signal Messenger](https://signal.org/) for two-way messaging. Send a **Note-to-Self** message from your phone → pi receives it, the LLM processes it, and pi replies back automatically.
 
@@ -31,7 +31,7 @@ You can also send the response to someone else in your contacts using their name
 
 ```bash
 # 1. Install the pi package
-pi install @aalzubidy/pi-signal
+pi install @gordoneiza/pi-signal
 
 # 2. Run the signal-cli REST API container (adjust image/port/volume to taste)
 docker run -d --name signal-api --restart unless-stopped \
