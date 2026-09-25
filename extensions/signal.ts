@@ -192,6 +192,25 @@ async function removeReaction(
 	return res.ok;
 }
 
+/**
+ * Send a typing indicator ("message is being written…") via the REST API.
+ * PUT shows the indicator, DELETE hides it.
+ */
+async function sendTypingIndicator(
+	recipient: string,
+	action: "started" | "stopped",
+): Promise<boolean> {
+	if (!PI_SIGNAL_ACCOUNT) return false;
+	debug(`[signal] typing indicator ${action} -> ${recipient}`);
+	const res = await restApi(
+		action === "started" ? "PUT" : "DELETE",
+		`/v1/typing-indicator/${encodeURIComponent(PI_SIGNAL_ACCOUNT)}`,
+		{ recipient },
+	);
+	debug(`[signal] typing indicator ${action} result: ok=${res.ok}, error=${res.error}`);
+	return res.ok;
+}
+
 /** List contacts via the REST API. */
 async function listContacts(): Promise<Array<Record<string, unknown>>> {
 	const res = await restApi("GET", `/v1/contacts/${encodeURIComponent(PI_SIGNAL_ACCOUNT)}?all_recipients=true`);
@@ -230,6 +249,13 @@ export default function (pi: ExtensionAPI) {
 		targetAuthor: string;
 		timestamp: number;
 	} | null = null;
+
+	// Numbers with an active typing indicator ("message is being written…"),
+	// shown while the agent is working on a response for them.
+	const activeTyping = new Set<string>();
+	// Per-recipient heartbeat timers that keep the typing indicator alive
+	// (signal-cli expires it after ~15 seconds, so we resend every 10s).
+	const typingHeartbeats = new Map<string, ReturnType<typeof setInterval>>();
 
 	// Track the current Signal sender context so we can send the agent's
 	// response back to Signal automatically.
@@ -681,6 +707,42 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	/** Stop typing indicators for all tracked numbers (no-op if none active). */
+	function stopTypingIndicators(): void {
+		stopTypingForAll();
+		for (const number of activeTyping) {
+			void sendTypingIndicator(number, "stopped");
+		}
+		activeTyping.clear();
+	}
+
+	/** Clear heartbeat timers for all tracked numbers (doesn't send stop). */
+	function stopTypingForAll(): void {
+		for (const timer of typingHeartbeats.values()) {
+			clearInterval(timer);
+		}
+		typingHeartbeats.clear();
+	}
+
+	/** Stop heartbeat timer for a single recipient (idempotent). */
+	function stopTypingHeartbeat(number: string): void {
+		const timer = typingHeartbeats.get(number);
+		if (timer) {
+			clearInterval(timer);
+			typingHeartbeats.delete(number);
+		}
+	}
+
+	/** Start a typing heartbeat: resend "started" every 10s while the agent works. */
+	function startTypingHeartbeat(number: string): void {
+		typingHeartbeats.set(
+			number,
+			setInterval(() => {
+				sendTypingIndicator(number, "started").catch(() => {});
+			}, 10_000),
+		);
+	}
+
 	function forwardToAgent(parsed: {
 		sender: string;
 		number: string;
@@ -704,6 +766,18 @@ export default function (pi: ExtensionAPI) {
 					if (!ok) console.error("[signal] failed to send 👀 reaction");
 				},
 			);
+		}
+
+		// Show the typing indicator while the agent works on this response.
+		if (/^\+\d{7,15}$/.test(parsed.number)) {
+			sendTypingIndicator(parsed.number, "started").then((ok) => {
+				if (ok) {
+					activeTyping.add(parsed.number);
+					startTypingHeartbeat(parsed.number);
+				} else {
+					console.error(`[signal] failed to send typing indicator to ${parsed.number}`);
+				}
+			});
 		}
 
 		const formatted = `[Signal from ${parsed.sender} (${parsed.number})]: ${parsed.body}`;
@@ -1051,6 +1125,8 @@ export default function (pi: ExtensionAPI) {
 	// Auto-send agent responses back to Signal, with stats footer
 	pi.on("agent_end", async (event: unknown, ctx: unknown) => {
 		debug(`[signal] agent_end: currentSignalSender=${currentSignalSender ? JSON.stringify(currentSignalSender) : "null"}`);
+		// The agent finished this turn — clear any typing indicators.
+		stopTypingIndicators();
 		if (!currentSignalSender) {
 			debug("[signal] agent_end: no currentSignalSender, skipping");
 			return;
@@ -1137,6 +1213,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		stopTypingIndicators();
 		cleanupWebSocket();
 	});
 
@@ -1182,6 +1259,13 @@ export default function (pi: ExtensionAPI) {
 
 			if (!ok) {
 				throw new Error(`Failed to send Signal message.`);
+			}
+
+			// A message just landed in that conversation — clear its typing indicator.
+			if (activeTyping.has(cleaned)) {
+				activeTyping.delete(cleaned);
+				stopTypingHeartbeat(cleaned);
+				void sendTypingIndicator(cleaned, "stopped");
 			}
 
 			if (pendingReaction) {

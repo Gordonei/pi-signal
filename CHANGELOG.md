@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Signal typing indicator:** while the agent is working on a response, the extension shows the Signal typing indicator ("message is being written…") to the sender. A 10-second heartbeat keeps the indicator alive during long turns (signal-cli expires it after ~15 seconds). The indicator is cleared when the reply is sent or the turn ends.
+
 ## 2.0.0
 
 Major release — the integration has moved from the native signal-cli daemon to the bbernhard/signal-cli-rest-api container. Breaking changes: `PI_SIGNAL_DAEMON_URL` default port moved 8080 → 8090, `PI_SIGNAL_QUIET_DAEMON` removed, TUI commands `/signal-start`, `/signal-stop`, `/signal-restart`, `/signal-logs` removed, and setup now requires Docker instead of host Java/signal-cli/systemd.

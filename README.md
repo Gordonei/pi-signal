@@ -8,10 +8,10 @@ Connect [pi](https://pi.dev) to [Signal Messenger](https://signal.org/) for two-
 
 ```
 Phone (Note-to-Self) → bbernhard/signal-cli-rest-api (Docker, REST + WebSocket) → pi extension
-    → 👀 reaction → LLM processes → auto-reply → ✅ reaction
+    → 👀 reaction → ⌨️ typing indicator → LLM processes → auto-reply → ✅ reaction
 ```
 
-The extension talks to the [bbernhard/signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) container over REST (send, reactions, contacts, health) and a persistent WebSocket on `/v1/receive/{number}` for incoming messages. signal-cli itself runs inside the container — there is no host daemon, no log file, and no systemd unit to manage.
+The extension talks to the [bbernhard/signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) container over REST (send, reactions, contacts, health, typing indicator) and a persistent WebSocket on `/v1/receive/{number}` for incoming messages. While the agent is working on a response, the Signal typing indicator ("message is being written…") is shown to the sender and cleared when the reply arrives. signal-cli itself runs inside the container — there is no host daemon, no log file, and no systemd unit to manage.
 
 Commands (`/model`, `/abort`, `/clear`, `/stats`, `/status`, `/whoami`, `/resend`, `/pause`, `/resume`, `/help`) are handled locally without LLM. Everything else is forwarded to the LLM.
 
