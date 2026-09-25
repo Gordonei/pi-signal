@@ -148,6 +148,8 @@ pi extension (signal.ts)
 | `PI_SIGNAL_ALLOWLIST` | No | empty = self only | Comma-separated E.164 numbers allowed to send/receive with the agent. `PI_SIGNAL_ACCOUNT` is always allowed regardless. |
 | `PI_SIGNAL_STATS` | No | `short` | Default stats mode: `off`, `short`, or `full` |
 | `PI_SIGNAL_DEBUG` | No | `false` | Set to `"true"` or `"1"` to enable verbose debug logging from the Signal extension. When off, only `console.error` messages appear. |
+| `PI_SIGNAL_ATTACHMENTS_DIR` | No | `/tmp/pi-signal/attachments` | Directory where incoming media attachments (images, PDFs) are downloaded |
+| `PI_SIGNAL_MAX_ATTACHMENT_AGE_DAYS` | No | `7` | Days after which old attachment files are auto-deleted |
 
 ---
 
@@ -237,6 +239,15 @@ These are also available as slash commands in pi's interactive TUI mode:
 | `/signal-model <name>` | Switch model by fuzzy-matching partial name |
 | `/signal-abort` | Stop current LLM generation |
 | `/signal-stats [short\|full\|off]` | View or toggle stats mode |
+
+## Media Attachments
+
+When the LLM receives a Signal message that includes images or PDFs, the attachment files
+are downloaded to `PI_SIGNAL_ATTACHMENTS_DIR` (default `/tmp/pi-signal/attachments`).
+File paths are included in the message context, and the LLM can inspect them using pi's
+built-in `read` tool.
+
+Attachments are auto-cleaned after `PI_SIGNAL_MAX_ATTACHMENT_AGE_DAYS` (default: 7 days).
 
 ## Tools (LLM-accessible)
 

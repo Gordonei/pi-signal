@@ -1,13 +1,13 @@
 # @gordoneiza/pi-signal
 
-Connect [pi](https://pi.dev) to [Signal Messenger](https://signal.org/) for two-way messaging. Send a **Note-to-Self** message from your phone → pi receives it, the LLM processes it, and pi replies back automatically.
+Connect [pi](https://pi.dev) to [Signal Messenger](https://signal.org/) for two-way messaging. Send a message from your phone to the Signal account that pi is connected to, and pi receives it, the LLM processes it, and pi replies back automatically. A standalone Signal CLI REST API implementation is used to handle talking to the Signal. 
 
 > **By default, only your own number is allowed.** Note-to-Self messages are always processed; messages from other numbers are only accepted if that number is in `PI_SIGNAL_ALLOWLIST`. Non-allowlisted senders get a 🚫 reaction and a short rejection reply, and sends to them are blocked.
 
 ## How It Works
 
 ```
-Phone (Note-to-Self) → bbernhard/signal-cli-rest-api (Docker, REST + WebSocket) → pi extension
+Phone → bbernhard/signal-cli-rest-api (Docker, REST + WebSocket) → pi extension
     → 👀 reaction → ⌨️ typing indicator → LLM processes → auto-reply → ✅ reaction
 ```
 
@@ -47,6 +47,9 @@ export PI_SIGNAL_ACCOUNT=+1234567890   # your Signal number (E.164)
 export PI_SIGNAL_PRIMARY=true          # marks this instance as the one handling Signal
 # Optional — numbers allowed to send/receive with the agent (self is always allowed):
 # export PI_SIGNAL_ALLOWLIST=+15551234567,+441234567890
+# Optional — download media attachments (images, PDFs) to disk:
+# export PI_SIGNAL_ATTACHMENTS_DIR=/tmp/pi-signal/attachments  # default
+# export PI_SIGNAL_MAX_ATTACHMENT_AGE_DAYS=7                     # default
 
 # 5. Start pi (restart it or run /reload if already running), then verify:
 pi
@@ -55,6 +58,11 @@ pi
 ```
 
 Send a Note-to-Self from your phone. pi receives it (👀), processes it, and replies automatically (✅).
+
+**Media attachments:** When you send an image or PDF with text, pi downloads the attachment
+and provides the file path to the LLM, which can inspect it using pi's built-in `read` tool.
+Attachments are stored in `PI_SIGNAL_ATTACHMENTS_DIR` and auto-cleaned after
+`PI_SIGNAL_MAX_ATTACHMENT_AGE_DAYS` days.
 
 ## Environment Variables
 
@@ -66,6 +74,8 @@ Send a Note-to-Self from your phone. pi receives it (👀), processes it, and re
 | `PI_SIGNAL_ALLOWLIST` | No | empty = self only | Comma-separated E.164 numbers allowed to send/receive with the agent. `PI_SIGNAL_ACCOUNT` is always allowed regardless. |
 | `PI_SIGNAL_STATS` | No | `short` | Stats mode: `off`, `short`, or `full` |
 | `PI_SIGNAL_DEBUG` | No | `false` | Set `"true"` or `"1"` to enable verbose debug logging from the Signal extension |
+| `PI_SIGNAL_ATTACHMENTS_DIR` | No | `/tmp/pi-signal/attachments` | Directory for downloaded media attachments (images, PDFs) |
+| `PI_SIGNAL_MAX_ATTACHMENT_AGE_DAYS` | No | `7` | Days before old attachments are auto-deleted |
 
 ## Commands (from Signal)
 

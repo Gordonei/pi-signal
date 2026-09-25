@@ -6,6 +6,11 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import * as http from "node:http";
 import * as https from "node:https";
+import * as attachments from "./attachments.js";
+import { ATTACHMENTS_DIR } from "./attachments.js";
+import { createDebug } from "./debug.js";
+
+const debug = createDebug("signal");
 
 // ── Configuration ─────────────────────────────────────────────────────
 
@@ -22,20 +27,8 @@ const PI_SIGNAL_PRIMARY =
 	process.env.PI_SIGNAL_PRIMARY === "1" ||
 	process.env.PI_SIGNAL_PRIMARY === "yes";
 
-// Debug logging: when set to true/1/log, all debug messages are shown.
-// When false/0/undefined, only console.error messages appear.
-const PI_SIGNAL_DEBUG = (process.env.PI_SIGNAL_DEBUG || "false").toLowerCase();
-const DEBUG_ENABLED = PI_SIGNAL_DEBUG === "true" || PI_SIGNAL_DEBUG === "1" || PI_SIGNAL_DEBUG === "log";
 
-/**
- * Debug logger — outputs only when PI_SIGNAL_DEBUG is enabled.
- * Uses console.log internally, so it respects normal log filtering.
- */
-function debug(...args: unknown[]): void {
-	if (DEBUG_ENABLED) {
-		console.log(...args);
-	}
-}
+
 
 // Allowlist of phone numbers (comma-separated, E.164 format, no spaces).
 const PI_SIGNAL_ALLOWLIST = (process.env.PI_SIGNAL_ALLOWLIST || "").trim();
@@ -280,12 +273,13 @@ export default function (pi: ExtensionAPI) {
 	 * In json-rpc-native mode the WebSocket sends JSON-RPC messages like:
 	 * { jsonrpc: "2.0", method: "receive", params: { envelope: {...}, account: "..." } }
 	 */
-	function parseEnvelope(data: string): {
+	async function parseEnvelope(data: string): Promise<{
 		sender: string;
 		number: string;
 		body: string;
 		timestamp: number;
-	} | null {
+		attachments: string[];
+	} | null> {
 		let raw: unknown;
 		try {
 			raw = JSON.parse(data);
@@ -350,11 +344,6 @@ export default function (pi: ExtensionAPI) {
 					(sm.body as string | undefined) || (sm.message as string | undefined);
 			}
 		}
-		if (!body || typeof body !== "string" || body.trim() === "") {
-			debug(`[signal] no body extracted, body=${JSON.stringify(body)}`);
-			return null;
-		}
-
 		// Extract message timestamp
 		let timestamp: number = 0;
 		if (env.dataMessage && typeof env.dataMessage === "object") {
@@ -385,7 +374,30 @@ export default function (pi: ExtensionAPI) {
 			sender = env.sourceName;
 		}
 
-		return { sender, number, body: body.trim(), timestamp };
+		// Download any attachments from the message
+		let downloadedAttachments: string[] = [];
+		if (env.dataMessage && typeof env.dataMessage === "object") {
+			const attachmentUrls = (env.dataMessage as Record<string, unknown>).attachments;
+			if (Array.isArray(attachmentUrls)) {
+				downloadedAttachments = await attachments.downloadAttachments(
+					env.dataMessage as Record<string, unknown>,
+					ATTACHMENTS_DIR,
+					SIGNAL_DAEMON_URL,
+				);
+			}
+		}
+
+		// If no body and no attachments, drop the message
+		if (!body || typeof body !== "string" || body.trim() === "") {
+			if (downloadedAttachments.length === 0) {
+				debug(`[signal] no body and no attachments, dropping message, body=${JSON.stringify(body)}`);
+				return null;
+			}
+			body = "[Image attachment]";
+		}
+
+		debug(`[signal] parsed -> from ${number}: "${body}", attachments=${downloadedAttachments.length}`);
+		return { sender, number, body: body.trim(), timestamp, attachments: downloadedAttachments };
 	}
 
 	// ── Command Handlers ────────────────────────────────────────────
@@ -743,11 +755,12 @@ export default function (pi: ExtensionAPI) {
 		);
 	}
 
-	function forwardToAgent(parsed: {
+	async function forwardToAgent(parsed: {
 		sender: string;
 		number: string;
 		body: string;
 		timestamp: number;
+		attachments: string[];
 	}) {
 		currentSignalSender = {
 			number: parsed.number,
@@ -780,7 +793,12 @@ export default function (pi: ExtensionAPI) {
 			});
 		}
 
-		const formatted = `[Signal from ${parsed.sender} (${parsed.number})]: ${parsed.body}`;
+		// Format message text, including attachment paths for the LLM to see
+		const attachmentPaths = parsed.attachments.join(", ");
+		let formatted = `[Signal from ${parsed.sender} (${parsed.number})]: ${parsed.body}`;
+		if (attachmentPaths) {
+			formatted += `\n\n[Attachments: ${attachmentPaths}]`;
+		}
 		pi.sendUserMessage(formatted, { deliverAs: "followUp" });
 	}
 
@@ -889,6 +907,7 @@ export default function (pi: ExtensionAPI) {
 		number: string;
 		body: string;
 		timestamp: number;
+		attachments: string[];
 	}) {
 		debug(`[signal] injectMessage: number=${parsed.number}, account=${PI_SIGNAL_ACCOUNT}, paused=${paused}`);
 		// Note-to-Self messages: only process from own account
@@ -995,14 +1014,14 @@ export default function (pi: ExtensionAPI) {
 				wsReconnectDelay = WS_RETRY_DELAY_INITIAL;
 			};
 
-			ws.onmessage = (event: MessageEvent) => {
+			ws.onmessage = async (event: MessageEvent) => {
 				const data = typeof event.data === "string" ? event.data : event.data.toString("utf8");
 				if (!data.trim()) return;
 
 				debug(`[signal] WS raw (first 200): ${data.slice(0, 200)}`);
-				const parsed = parseEnvelope(data);
+				const parsed = await parseEnvelope(data);
 				if (parsed) {
-					debug(`[signal] parsed -> from ${parsed.number}: "${parsed.body}"`);
+					debug(`[signal] parsed -> from ${parsed.number}: "${parsed.body}", attachments=${parsed.attachments.length}`);
 					injectMessage(parsed);
 				} else {
 					debug(`[signal] parseEnvelope returned null — message DROPPED`);
@@ -1114,12 +1133,37 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Lifecycle ─────────────────────────────────────────────────────
 
+	/** Periodic cleanup of old attachment files (every 6 hours). */
+	let cleanupTimer: ReturnType<typeof setTimeout> | null = null;
+
+	function startAttachmentCleanup(): void {
+		const scheduleNext = () => {
+			cleanupTimer = setTimeout(() => {
+				attachments.cleanupAttachments();
+				scheduleNext();
+			}, 6 * 60 * 60 * 1000);
+		};
+		// Initial cleanup after 30 seconds
+		cleanupTimer = setTimeout(() => {
+			attachments.cleanupAttachments();
+			scheduleNext();
+		}, 30_000);
+	}
+
+	function stopAttachmentCleanup(): void {
+		if (cleanupTimer) {
+			clearTimeout(cleanupTimer);
+			cleanupTimer = null;
+		}
+	}
+
 	pi.on("session_start", async (_event: unknown, ctx: unknown) => {
 		extCtx = ctx as ExtensionContext | null;
 
 		resolvedAccountId = await resolveAccountId();
 
 		startWebSocketListener();
+		startAttachmentCleanup();
 	});
 
 	// Auto-send agent responses back to Signal, with stats footer
@@ -1215,6 +1259,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => {
 		stopTypingIndicators();
 		cleanupWebSocket();
+		stopAttachmentCleanup();
 	});
 
 	// ── Tool: signal_send ──────────────────────────────────────────
