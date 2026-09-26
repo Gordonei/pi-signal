@@ -4,15 +4,28 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import * as http from "node:http";
-import * as https from "node:https";
 import * as attachments from "./attachments.js";
+import { createSignalRestClient } from "./rest-client.js";
 import { ATTACHMENTS_DIR } from "./attachments.js";
-import { createDebug } from "./debug.js";
-
-const debug = createDebug("signal");
+import {
+	createDebug,
+	isLoggingEnabled,
+	isAllowedNumber,
+	levenshtein,
+	fuzzyMatchModels,
+	sanitizeContactName,
+	formatTokens,
+	buildStatsFooter,
+	normalizePhoneNumber,
+	isValidE164,
+	parseSignalEnvelope,
+	formatIncomingMessage,
+	extractReplyText,
+} from "./utils.js";
 
 // ── Configuration ─────────────────────────────────────────────────────
+
+const debug = createDebug("signal");
 
 const PI_SIGNAL_ACCOUNT = process.env.PI_SIGNAL_ACCOUNT || "";
 
@@ -36,23 +49,13 @@ const PI_SIGNAL_ALLOWLIST = (process.env.PI_SIGNAL_ALLOWLIST || "").trim();
 // Parse the allowlist into a Set of normalized E.164 numbers.
 const ALLOWED_NUMBERS = new Set(
 	PI_SIGNAL_ALLOWLIST.split(",")
-		.map((n) => n.replace(/[\s\-().]/g, ""))
+		.map((n) => normalizePhoneNumber(n))
 		.filter((n) => /^[+]?\d+$/.test(n)),
 );
 
-// Helper: check whether a number is allowed.
-// Default behaviour: only PI_SIGNAL_ACCOUNT (self) is allowed.
-// If PI_SIGNAL_ALLOWLIST is set, those numbers are additionally allowed.
-function isAllowedNumber(number: string): boolean {
-	const cleaned = number.replace(/[\s\-().]/g, "");
-	// Self is always allowed
-	if (cleaned === PI_SIGNAL_ACCOUNT) return true;
-	// If allowlist is set, check against it
-	if (PI_SIGNAL_ALLOWLIST) {
-		return ALLOWED_NUMBERS.has(cleaned);
-	}
-	// Empty allowlist = only self allowed
-	return false;
+// Wrapper for the env-aware isAllowedNumber
+function isAllowedNumberLocal(number: string): boolean {
+	return isAllowedNumber(number, PI_SIGNAL_ACCOUNT, PI_SIGNAL_ALLOWLIST);
 }
 
 // Default stats mode
@@ -64,168 +67,20 @@ const DEFAULT_STATS_MODE = (
 const WS_RETRY_DELAY_INITIAL = 2000;
 const WS_RETRY_DELAY_MAX = 60_000;
 
-// ── REST API helper ───────────────────────────────────────────────────
+// ── REST client ───────────────────────────────────────────────────────
+const {
+	sendMessage,
+	sendReaction,
+	removeReaction,
+	sendTypingIndicator,
+	listContacts,
+	getApiAbout,
+} = createSignalRestClient({
+	daemonUrl: SIGNAL_DAEMON_URL,
+	account: PI_SIGNAL_ACCOUNT,
+});
 
-/**
- * Issue a REST request to the bbernhard/signal-cli-rest-api container.
- * This replaces the old JSON-RPC daemonRpc() calls.
- */
-async function restApi(
-	method: "GET" | "POST" | "PUT" | "DELETE",
-	path: string,
-	body?: Record<string, unknown>,
-): Promise<{ ok: boolean; result?: unknown; error?: string }> {
-	const baseUrl = new URL(SIGNAL_DAEMON_URL);
-	const url = new URL(path, SIGNAL_DAEMON_URL);
-	// Use the hostname/port from the base URL but keep the path
-	const target = new URL(path, SIGNAL_DAEMON_URL);
-
-	const isHttps = baseUrl.protocol === "https:";
-	const lib = isHttps ? https : http;
-
-	const headers: Record<string, string> = {
-		"Content-Type": "application/json",
-	};
-
-	const opts: http.RequestOptions = {
-		hostname: target.hostname,
-		port: target.port || (isHttps ? 443 : 80),
-		path: target.pathname + (target.search || ""),
-		method,
-		headers,
-		timeout: 15000,
-	};
-
-	return new Promise((resolve) => {
-		const req = lib.request(opts, (res) => {
-			const chunks: Buffer[] = [];
-			res.on("data", (chunk: Buffer) => chunks.push(chunk));
-			res.on("end", () => {
-				const raw = Buffer.concat(chunks).toString("utf8");
-				if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-					try {
-						resolve({ ok: true, result: JSON.parse(raw) });
-					} catch {
-						// No content (204) or non-JSON
-						if (raw.trim()) {
-							resolve({ ok: true, result: raw });
-						} else {
-							resolve({ ok: true, result: null });
-						}
-					}
-				} else {
-					try {
-						const err = JSON.parse(raw);
-						resolve({ ok: false, error: err?.error || "unknown error" });
-					} catch {
-						resolve({ ok: false, error: `HTTP ${res.statusCode || "unknown"}` });
-					}
-				}
-			});
-		});
-
-		req.on("error", (err) => {
-			resolve({ ok: false, error: err.message });
-		});
-
-		req.on("timeout", () => {
-			req.destroy();
-			resolve({ ok: false, error: "request timeout" });
-		});
-
-		if (body) {
-			req.write(JSON.stringify(body));
-		}
-		req.end();
-	});
-}
-
-/** Send a signal message via the REST API. */
-async function sendMessage(
-	recipient: string,
-	message: string,
-): Promise<boolean> {
-	debug(`[signal] sendMessage -> recipients=[${recipient}], as=${PI_SIGNAL_ACCOUNT}`);
-	const res = await restApi("POST", "/v1/send", {
-		number: PI_SIGNAL_ACCOUNT,
-		recipients: [recipient],
-		message,
-	});
-	debug(`[signal] sendMessage result: ok=${res.ok}, error=${res.error}`);
-	return res.ok;
-}
-
-/** Send an emoji reaction via the REST API. */
-async function sendReaction(
-	recipient: string,
-	targetAuthor: string,
-	timestamp: number,
-	emoji: string,
-): Promise<boolean> {
-	const res = await restApi("POST", `/v1/reactions/${encodeURIComponent(PI_SIGNAL_ACCOUNT)}`, {
-		reaction: emoji,
-		recipient,
-		target_author: targetAuthor,
-		timestamp,
-	});
-	return res.ok;
-}
-
-/** Remove a reaction via the REST API. */
-async function removeReaction(
-	recipient: string,
-	targetAuthor: string,
-	timestamp: number,
-): Promise<boolean> {
-	const res = await restApi("DELETE", `/v1/reactions/${encodeURIComponent(PI_SIGNAL_ACCOUNT)}`, {
-		recipient,
-		target_author: targetAuthor,
-		timestamp,
-	});
-	return res.ok;
-}
-
-/**
- * Send a typing indicator ("message is being written…") via the REST API.
- * PUT shows the indicator, DELETE hides it.
- */
-async function sendTypingIndicator(
-	recipient: string,
-	action: "started" | "stopped",
-): Promise<boolean> {
-	if (!PI_SIGNAL_ACCOUNT) return false;
-	debug(`[signal] typing indicator ${action} -> ${recipient}`);
-	const res = await restApi(
-		action === "started" ? "PUT" : "DELETE",
-		`/v1/typing-indicator/${encodeURIComponent(PI_SIGNAL_ACCOUNT)}`,
-		{ recipient },
-	);
-	debug(`[signal] typing indicator ${action} result: ok=${res.ok}, error=${res.error}`);
-	return res.ok;
-}
-
-/** List contacts via the REST API. */
-async function listContacts(): Promise<Array<Record<string, unknown>>> {
-	const res = await restApi("GET", `/v1/contacts/${encodeURIComponent(PI_SIGNAL_ACCOUNT)}?all_recipients=true`);
-	if (!res.ok || !Array.isArray(res.result)) {
-		console.error(`[signal] listContacts failed: ${res.error || "unknown"}`);
-		return [];
-	}
-	return res.result as Array<Record<string, unknown>>;
-}
-
-/** Get the about/version info of the API. */
-async function getApiAbout(): Promise<{ ok: boolean; version?: string }> {
-	const res = await restApi("GET", "/v1/about");
-	if (!res.ok) return { ok: false };
-	const data = res.result as Record<string, unknown> | undefined;
-	return {
-		ok: true,
-		version: (data?.version as string) || undefined,
-	};
-}
-
-// ── Extension ──────────────────────────────────────────────────────────
+// ── Extension ───────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
 	// WebSocket state (incoming messages via the bbernhard REST API)
@@ -272,241 +127,63 @@ export default function (pi: ExtensionAPI) {
 	 * Parse a message from the REST API WebSocket format.
 	 * In json-rpc-native mode the WebSocket sends JSON-RPC messages like:
 	 * { jsonrpc: "2.0", method: "receive", params: { envelope: {...}, account: "..." } }
+	 *
+	 * The pure parsing logic lives in parseSignalEnvelope() (utils.ts) so it
+	 * can be unit-tested in isolation; this wrapper wires in attachment
+	 * downloads against the local REST API.
 	 */
-	async function parseEnvelope(data: string): Promise<{
-		sender: string;
-		number: string;
-		body: string;
-		timestamp: number;
-		attachments: string[];
-	} | null> {
-		let raw: unknown;
-		try {
-			raw = JSON.parse(data);
-		} catch (err) {
-			console.error(`[signal] JSON parse failed: ${(err as Error).message}`);
-			return null;
-		}
-		if (!raw || typeof raw !== "object") {
-			debug(`[signal] not an object, type=${typeof raw}`);
-			return null;
-		}
-
-		const obj = raw as Record<string, unknown>;
-
-		// Debug: log top-level keys to identify format
-		debug(`[signal] WS top-level keys: [${Object.keys(obj).join(", ")}]`);
-
-		// In json-rpc-native mode, envelope is under params;
-		// in native/native mode it would be directly on the object.
-		const paramsObj = obj.params as Record<string, unknown> | undefined;
-		const env = paramsObj?.envelope as Record<string, unknown> | undefined
-			|| obj.envelope as Record<string, unknown> | undefined;
-		if (!env) {
-			debug(`[signal] no envelope found (params?.envelope=${!!paramsObj?.envelope}, obj.envelope=${!!obj.envelope})`);
-			return null;
-		}
-		debug(`[signal] envelope keys: [${Object.keys(env).join(", ")}]`);
-
-		// Extract message body
-		let body: string | undefined;
-		let isNoteToSelf = false;
-
-		// Check dataMessage (normal incoming messages)
-		if (env.dataMessage && typeof env.dataMessage === "object") {
-			const dm = env.dataMessage as Record<string, unknown>;
-			body = (dm.body as string | undefined) || (dm.message as string | undefined);
-			debug(`[signal] dataMessage body=${JSON.stringify(body)}, fields=${Object.keys(dm).join(", ")}`);
-		}
-
-		// Check syncMessage (Note to Self / synced from other devices)
-		if (!body && env.syncMessage && typeof env.syncMessage === "object") {
-			const sm = env.syncMessage as Record<string, unknown>;
-			if (sm.sentMessage && typeof sm.sentMessage === "object") {
-				const sentMsg = sm.sentMessage as Record<string, unknown>;
-				const destination =
-					(sentMsg.destinationNumber as string | undefined) ||
-					(sentMsg.destination as string | undefined);
-				body =
-					(sentMsg.message as string | undefined) ||
-					(sentMsg.body as string | undefined);
-				if (body && PI_SIGNAL_ACCOUNT && destination === PI_SIGNAL_ACCOUNT) {
-					isNoteToSelf = true;
-					debug(`[signal] Note-to-Self: dest=${destination} === account=${PI_SIGNAL_ACCOUNT}`);
-				} else if (body) {
-					// A synced message to someone else — ignore it.
-					debug(`dropped synced msg to other, dest=${destination}`);
-					return null;
-				}
-			}
-			if (!body) {
-				body =
-					(sm.body as string | undefined) || (sm.message as string | undefined);
-			}
-		}
-		// Extract message timestamp
-		let timestamp: number = 0;
-		if (env.dataMessage && typeof env.dataMessage === "object") {
-			timestamp = ((env.dataMessage as Record<string, unknown>).timestamp as number) || 0;
-		}
-		if (!timestamp && isNoteToSelf && env.syncMessage && typeof env.syncMessage === "object") {
-			const sm = env.syncMessage as Record<string, unknown>;
-			if (sm.sentMessage && typeof sm.sentMessage === "object") {
-				timestamp = ((sm.sentMessage as Record<string, unknown>).timestamp as number) || 0;
-			}
-		}
-
-		// Extract sender number
-		let number = "unknown";
-		if (isNoteToSelf && PI_SIGNAL_ACCOUNT) {
-			number = PI_SIGNAL_ACCOUNT;
-		} else if (typeof env.sourceNumber === "string" && env.sourceNumber) {
-			number = env.sourceNumber;
-		} else if (typeof env.source === "string" && env.source) {
-			number = env.source;
-		}
-
-		// Extract sender display name
-		let sender: string = number;
-		if (isNoteToSelf) {
-			sender = "Self";
-		} else if (typeof env.sourceName === "string" && env.sourceName) {
-			sender = env.sourceName;
-		}
-
-		// Download any attachments from the message
-		let downloadedAttachments: string[] = [];
-		if (env.dataMessage && typeof env.dataMessage === "object") {
-			const attachmentUrls = (env.dataMessage as Record<string, unknown>).attachments;
-			if (Array.isArray(attachmentUrls)) {
-				downloadedAttachments = await attachments.downloadAttachments(
-					env.dataMessage as Record<string, unknown>,
-					ATTACHMENTS_DIR,
-					SIGNAL_DAEMON_URL,
-				);
-			}
-		}
-
-		// If no body and no attachments, drop the message
-		if (!body || typeof body !== "string" || body.trim() === "") {
-			if (downloadedAttachments.length === 0) {
-				debug(`[signal] no body and no attachments, dropping message, body=${JSON.stringify(body)}`);
-				return null;
-			}
-			body = "[Image attachment]";
-		}
-
-		debug(`[signal] parsed -> from ${number}: "${body}", attachments=${downloadedAttachments.length}`);
-		return { sender, number, body: body.trim(), timestamp, attachments: downloadedAttachments };
+	async function parseEnvelope(data: string) {
+		return parseSignalEnvelope(
+			data,
+			PI_SIGNAL_ACCOUNT,
+			(dm) =>
+				attachments.downloadAttachments(dm, ATTACHMENTS_DIR, SIGNAL_DAEMON_URL),
+		);
 	}
 
 	// ── Command Handlers ────────────────────────────────────────────
 
-	function buildStatsFooter(
+	function buildStatsFooterLocal(
 		ctx: ExtensionContext | null,
 	): string {
 		if (!ctx || statsMode === "off") return "";
 
 		const usage = ctx.getContextUsage?.();
 		const model = ctx.model;
-		const modelName = model?.name || model?.id || "unknown";
-		const provider = model?.provider || "";
 
-		const tokensIn = usage?.tokens != null ? usage.tokens : null;
-		const pct = usage?.percent != null ? usage.percent : null;
+		const usageInfo = usage ? {
+			tokens: usage.tokens,
+			percent: usage.percent,
+			contextWindow: usage.contextWindow,
+		} : null;
 
-		if (statsMode === "short") {
-			const parts: string[] = [modelName];
-			if (tokensIn != null) {
-				parts.push(formatTokens(tokensIn) + " ctx");
-			}
-			if (pct != null) {
-				parts.push(Math.round(pct) + "%");
-			}
-			return "\n───\n" + parts.join(" · ");
-		}
+		const modelInfo = model ? {
+			name: model.name,
+			id: model.id,
+			provider: model.provider,
+		} : null;
 
-		const ctxWindow = usage?.contextWindow || null;
-		const lines: string[] = ["───"];
-		lines.push(`Model: ${modelName}${provider ? " (" + provider + ")" : ""}`);
-		if (tokensIn != null) {
-			lines.push(`Context: ${tokensIn.toLocaleString()} tokens`);
-		}
-		if (ctxWindow != null) {
-			lines.push(`Window: ${ctxWindow.toLocaleString()} tokens`);
-		}
-		if (pct != null) {
-			lines.push(`Usage: ${Math.round(pct)}%`);
-		}
-		return "\n" + lines.join("\n");
+		return buildStatsFooter(usageInfo, modelInfo, statsMode);
 	}
 
-	function formatTokens(n: number): string {
-		if (n >= 1000) return (n / 1000).toFixed(1) + "K";
-		return String(n);
+	function sanitizeContactNameLocal(s: string): string {
+		return sanitizeContactName(s);
 	}
 
-	function sanitizeContactName(s: string): string {
-		return s
-			.replace(/[\u0000-\u001F\u007F\u200B-\u200F\u2028\u2029]+/g, " ")
-			.replace(/\s+/g, " ")
-			.trim()
-			.slice(0, 100);
+	function levenshteinLocal(a: string, b: string): number {
+		return levenshtein(a, b);
 	}
 
-	function levenshtein(a: string, b: string): number {
-		const m = a.length;
-		const n = b.length;
-		const dp: number[][] = [];
-		for (let i = 0; i <= m; i++) {
-			dp[i] = [i];
-		}
-		for (let j = 0; j <= n; j++) {
-			dp[0][j] = j;
-		}
-		for (let i = 1; i <= m; i++) {
-			for (let j = 1; j <= n; j++) {
-				dp[i][j] = a[i - 1] === b[j - 1]
-					? dp[i - 1][j - 1]
-					: Math.min(dp[i - 1][j - 1], dp[i][j - 1], dp[i - 1][j]) + 1;
-			}
-		}
-		return dp[m][n];
-	}
-
-	function fuzzyMatchModels(
+	function fuzzyMatchModelsLocal(
 		query: string,
 		models: Array<{ label: string; model: unknown }>,
 	): Array<{ label: string; model: unknown; score: number }> {
-		const q = query.toLowerCase().trim();
-		if (!q) return [];
-
-		const scored: Array<{ label: string; model: unknown; score: number }> = [];
-
-		for (const entry of models) {
-			const label = entry.label.toLowerCase();
-			let score = Infinity;
-
-			if (label === q) {
-				score = 0;
-			} else if (label.includes(q)) {
-				const pos = label.indexOf(q);
-				score = 0.02 + (pos / Math.max(label.length, 1)) * 0.05;
-			} else {
-				const dist = levenshtein(label, q);
-				const maxLen = Math.max(label.length, q.length);
-				score = dist / Math.max(maxLen, 1);
-			}
-
-			scored.push({ label: entry.label, model: entry.model, score });
-		}
-
-		scored.sort((a, b) => {
-			if (a.score !== b.score) return a.score - b.score;
-			return a.label.length - b.label.length;
+		const labels = models.map((m) => m.label);
+		const results = fuzzyMatchModels(query, labels);
+		return results.map((r) => {
+			const match = models.find((m) => m.label === r.label);
+			return { label: r.label, model: match?.model ?? null, score: r.score };
 		});
-
-		return scored;
 	}
 
 	function getModelList(ctx: ExtensionContext): Array<{ label: string; model: unknown }> {
@@ -548,7 +225,7 @@ export default function (pi: ExtensionAPI) {
 			sendToSignal(parsed.number, text).then((ok) => {
 				if (ok) {
 					debug(`[signal] command reply sent: ${cmd}`);
-				} else {
+				} else if (isLoggingEnabled()) {
 					console.error(`[signal] failed to send command reply: ${cmd}`);
 				}
 			}).finally(() => {
@@ -601,7 +278,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const matches = fuzzyMatchModels(query, models);
+		const matches = fuzzyMatchModelsLocal(query, models);
 
 		const qLower = query.toLowerCase().trim();
 		for (const entry of models) {
@@ -687,7 +364,7 @@ export default function (pi: ExtensionAPI) {
 				debug("[signal] newSession not available on context");
 			}
 		} catch (err) {
-			console.error("[signal] /clear error:", err);
+			if (isLoggingEnabled()) console.error("[signal] /clear error:", err);
 		}
 	}
 
@@ -776,7 +453,7 @@ export default function (pi: ExtensionAPI) {
 			};
 			sendReaction(parsed.number, parsed.number, parsed.timestamp, "👀").then(
 				(ok) => {
-					if (!ok) console.error("[signal] failed to send 👀 reaction");
+					if (!ok && isLoggingEnabled()) console.error("[signal] failed to send 👀 reaction");
 				},
 			);
 		}
@@ -787,18 +464,14 @@ export default function (pi: ExtensionAPI) {
 				if (ok) {
 					activeTyping.add(parsed.number);
 					startTypingHeartbeat(parsed.number);
-				} else {
+				} else if (isLoggingEnabled()) {
 					console.error(`[signal] failed to send typing indicator to ${parsed.number}`);
 				}
 			});
 		}
 
 		// Format message text, including attachment paths for the LLM to see
-		const attachmentPaths = parsed.attachments.join(", ");
-		let formatted = `[Signal from ${parsed.sender} (${parsed.number})]: ${parsed.body}`;
-		if (attachmentPaths) {
-			formatted += `\n\n[Attachments: ${attachmentPaths}]`;
-		}
+		const formatted = formatIncomingMessage(parsed);
 		pi.sendUserMessage(formatted, { deliverAs: "followUp" });
 	}
 
@@ -918,7 +591,7 @@ export default function (pi: ExtensionAPI) {
 				const cmd = parts[0].toLowerCase();
 				const args = parts.slice(1);
 				handleCommand(parsed, cmd, args).catch((err) => {
-					console.error(`[signal] command error (${cmd}):`, err);
+					if (isLoggingEnabled()) console.error(`[signal] command error (${cmd}):`, err);
 				});
 			} else if (!paused) {
 				forwardToAgent(parsed);
@@ -927,7 +600,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// Messages from others: check allowlist
-		if (!isAllowedNumber(parsed.number)) {
+		if (!isAllowedNumberLocal(parsed.number)) {
 			debug(
 				`[signal] blocked message from ${parsed.number} (not in allowlist)`,
 			);
@@ -953,7 +626,7 @@ export default function (pi: ExtensionAPI) {
 			const cmd = parts[0].toLowerCase();
 			const args = parts.slice(1);
 			handleCommand(parsed, cmd, args).catch((err) => {
-				console.error(`[signal] command error (${cmd}):`, err);
+				if (isLoggingEnabled()) console.error(`[signal] command error (${cmd}):`, err);
 			});
 			return;
 		}
@@ -984,7 +657,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (!PI_SIGNAL_ACCOUNT) {
-			console.warn("[signal] PI_SIGNAL_ACCOUNT is not set — cannot start WebSocket listener.");
+			if (isLoggingEnabled()) console.warn("[signal] PI_SIGNAL_ACCOUNT is not set — cannot start WebSocket listener.");
 			return;
 		}
 
@@ -998,7 +671,6 @@ export default function (pi: ExtensionAPI) {
 		const wsPath = `/v1/receive/${encodeURIComponent(PI_SIGNAL_ACCOUNT)}?timeout=30`;
 
 		const isHttps = baseUrl.protocol === "https:";
-		const lib = isHttps ? https : http;
 
 		const protocol = isHttps ? "wss://" : "ws://";
 		const wsUrl = `${protocol}${baseUrl.hostname}:${baseUrl.port || 80}${wsPath}`;
@@ -1029,7 +701,7 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			ws.onerror = (err: Event) => {
-				console.error("[signal] WebSocket error:", err);
+				if (isLoggingEnabled()) console.error("[signal] WebSocket error:", err);
 				wsConnected = false;
 			};
 
@@ -1043,7 +715,7 @@ export default function (pi: ExtensionAPI) {
 			(ws as any).__cleanup = ws.close.bind(ws);
 			(globalThis as any).__signalWs = ws;
 		} catch (err) {
-			console.error(`[signal] WebSocket connection error: ${(err as Error).message}`);
+			if (isLoggingEnabled()) console.error(`[signal] WebSocket connection error: ${(err as Error).message}`);
 			wsConnected = false;
 			scheduleWsReconnect();
 		}
@@ -1183,34 +855,13 @@ export default function (pi: ExtensionAPI) {
 			const messages =
 				(event as { messages?: Array<{ role?: string; content?: unknown }> })
 					.messages ?? [];
-			const assistantMessages = messages.filter((m) => m.role === "assistant");
 
-			if (assistantMessages.length === 0) return;
-
-			const textParts: string[] = [];
-			for (const msg of assistantMessages) {
-				const content = msg.content;
-				if (typeof content === "string") {
-					textParts.push(content);
-				} else if (Array.isArray(content)) {
-					for (const part of content) {
-						if (
-							part &&
-							typeof part === "object" &&
-							(part as { type?: string }).type === "text"
-						) {
-							const text = (part as { text?: string }).text;
-							if (text) textParts.push(text);
-						}
-					}
-				}
-			}
-
-			let fullText = textParts.join("\n").trim();
+			// Pure extraction lives in extractReplyText() (utils.ts).
+			let fullText = extractReplyText(messages);
 			if (!fullText) return;
 
 			if (statsMode !== "off") {
-				const statsFooter = buildStatsFooter(ctx as ExtensionContext | null);
+				const statsFooter = buildStatsFooterLocal(ctx as ExtensionContext | null);
 				if (statsFooter) {
 					fullText += statsFooter;
 				}
@@ -1231,7 +882,7 @@ export default function (pi: ExtensionAPI) {
 					);
 				}
 			} else {
-				console.error(`[signal] failed to auto-reply to ${sender.number}`);
+				if (isLoggingEnabled()) console.error(`[signal] failed to auto-reply to ${sender.number}`);
 				if (sender.timestamp) {
 					await removeReaction(sender.number, sender.number, sender.timestamp);
 					await sendReaction(
@@ -1243,7 +894,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 		} catch (err) {
-			console.error("[signal] auto-reply error:", err);
+			if (isLoggingEnabled()) console.error("[signal] auto-reply error:", err);
 		}
 	});
 
@@ -1285,14 +936,14 @@ export default function (pi: ExtensionAPI) {
 			params: { recipient: string; message: string },
 			_signal?: AbortSignal,
 		) {
-			const cleaned = params.recipient.replace(/[\s\-().]/g, "");
-			if (!/^\+[1-9]\d{1,14}$/.test(cleaned)) {
+			const cleaned = normalizePhoneNumber(params.recipient);
+			if (!isValidE164(cleaned)) {
 				throw new Error(
 					`Invalid recipient "${params.recipient}". Must be E.164 format, e.g. +1234567890.`,
 				);
 			}
 
-			if (!isAllowedNumber(cleaned)) {
+			if (!isAllowedNumberLocal(cleaned)) {
 				throw new Error(
 					`Recipient ${cleaned} is not in the Signal allowlist. Only messages to allowed numbers can be sent.`,
 				);
@@ -1306,12 +957,11 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(`Failed to send Signal message.`);
 			}
 
-			// A message just landed in that conversation — clear its typing indicator.
-			if (activeTyping.has(cleaned)) {
-				activeTyping.delete(cleaned);
-				stopTypingHeartbeat(cleaned);
-				void sendTypingIndicator(cleaned, "stopped");
-			}
+			// Note: we deliberately do NOT clear the typing indicator here.
+			// The agent_end handler cleans up all typing indicators after the
+			// turn completes. Clearing them here races with the propagation of
+			// the started indicator through the Signal network — the client
+			// may never see it if it's stopped too quickly.
 
 			if (pendingReaction) {
 				const pr = pendingReaction;
@@ -1416,7 +1066,7 @@ export default function (pi: ExtensionAPI) {
 							.trim() ||
 						(c.username as string) ||
 						"";
-					return { name: sanitizeContactName(name), number };
+					return { name: sanitizeContactNameLocal(name), number };
 				})
 				.filter((c) => c.number && c.number !== PI_SIGNAL_ACCOUNT);
 
@@ -1468,7 +1118,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const matches = fuzzyMatchModels(query, models);
+			const matches = fuzzyMatchModelsLocal(query, models);
 			const best = matches.find((m) => m.score < 0.15);
 			if (best) {
 				const ok = await pi.setModel(best.model as any);
@@ -1547,8 +1197,8 @@ export default function (pi: ExtensionAPI) {
 
 			const rawNum = trimmed.slice(0, sep);
 			const message = trimmed.slice(sep + 1).trim();
-			const cleaned = rawNum.replace(/[\s\-().]/g, "");
-			if (!/^\+[1-9]\d{1,14}$/.test(cleaned)) {
+			const cleaned = normalizePhoneNumber(rawNum);
+			if (!isValidE164(cleaned)) {
 				extensionCtx.ui?.notify?.(
 					`Invalid number "${rawNum}". Use E.164 format, e.g. +1234567890.`,
 					"error",
@@ -1560,7 +1210,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			if (!isAllowedNumber(cleaned)) {
+			if (!isAllowedNumberLocal(cleaned)) {
 				extensionCtx.ui?.notify?.(
 					`⛔ ${cleaned} is not in the Signal allowlist. Only messages to allowed numbers can be sent.`,
 					"error",

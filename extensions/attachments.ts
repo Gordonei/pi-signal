@@ -6,7 +6,7 @@ import * as path from "node:path";
 import * as http from "node:http";
 import * as https from "node:https";
 import * as crypto from "node:crypto";
-import { createDebug } from "./debug.js";
+import { createDebug, isLoggingEnabled } from "./utils.js";
 
 const debug = createDebug("attachments");
 
@@ -93,7 +93,7 @@ function downloadAttachment(url: string, dir: string): Promise<string | null> {
 						debug?.(`[attachments] saved: ${filePath} (${data.length} bytes)`);
 						resolve(filePath);
 					} catch (err) {
-						console.error(`[attachments] write error for ${filePath}: ${(err as Error).message}`);
+						if (isLoggingEnabled()) console.error(`[attachments] write error for ${filePath}: ${(err as Error).message}`);
 						resolve(null);
 					}
 				});
@@ -102,7 +102,7 @@ function downloadAttachment(url: string, dir: string): Promise<string | null> {
 				resolve(null);
 			}
 		}).on("error", (err) => {
-			console.error(`[attachments] download error: ${(err as Error).message}`);
+			if (isLoggingEnabled()) console.error(`[attachments] download error: ${(err as Error).message}`);
 			resolve(null);
 		}).on("timeout", () => {
 			debug?.(`[attachments] download timeout for ${url}`);
@@ -189,10 +189,10 @@ export function cleanupAttachments(
 			}
 		}
 		if (cleaned > 0) {
-			console.error(`[attachments] cleaned ${cleaned} file(s) older than ${maxAgeDays} days from ${dir}`);
+			if (isLoggingEnabled()) console.error(`[attachments] cleaned ${cleaned} file(s) older than ${maxAgeDays} days from ${dir}`);
 		}
 	} catch (err) {
-		console.error(`[attachments] cleanup error: ${(err as Error).message}`);
+		if (isLoggingEnabled()) console.error(`[attachments] cleanup error: ${(err as Error).message}`);
 	}
 }
 
@@ -203,6 +203,6 @@ export function getAttachmentInfo(): { dir: string; enabled: boolean; maxAgeDays
 	return {
 		dir,
 		enabled: exists,
-		maxAgeDays,
+		maxAgeDays: MAX_ATTACHMENT_AGE_DAYS,
 	};
 }
