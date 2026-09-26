@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- **Unit tests** for utils, attachments, rest-client, message parsing, and signal integration (179 tests)
 - **Incoming media attachments:** images and PDFs sent with messages are downloaded to disk (default `/tmp/pi-signal/attachments`). File paths are passed to the LLM which can inspect them using pi's built-in `read` tool. Configurable via `PI_SIGNAL_ATTACHMENTS_DIR` and `PI_SIGNAL_MAX_ATTACHMENT_AGE_DAYS`.
 - **Signal typing indicator:** while the agent is working on a response, the extension shows the Signal typing indicator ("message is being written…") to the sender. A 10-second heartbeat keeps the indicator alive during long turns (signal-cli expires it after ~15 seconds). The indicator is cleared when the reply is sent or the turn ends.
 

@@ -1,5 +1,7 @@
 # @gordoneiza/pi-signal
 
+> A fork of [aalzubidy's package](https://github.com/aalzubidy/pi-signal).
+
 Connect [pi](https://pi.dev) to [Signal Messenger](https://signal.org/) for two-way messaging. Send a message from your phone to the Signal account that pi is connected to, and pi receives it, the LLM processes it, and pi replies back automatically. A standalone Signal CLI REST API implementation is used to handle talking to the Signal. 
 
 > **By default, only your own number is allowed.** Note-to-Self messages are always processed; messages from other numbers are only accepted if that number is in `PI_SIGNAL_ALLOWLIST`. Non-allowlisted senders get a 🚫 reaction and a short rejection reply, and sends to them are blocked.
@@ -27,7 +29,7 @@ You can also send the response to someone else in your contacts using their name
 
 ## Installation
 
-**Prerequisites:** [Docker](https://www.docker.com/) (or Podman), a Signal app on your phone. Java and signal-cli are not needed on the host — they run inside the container.
+**Prerequisites:** [Docker](https://www.docker.com/) (or Podman), a Signal app on your phone. 
 
 ```bash
 # 1. Install the pi package
@@ -73,7 +75,7 @@ Attachments are stored in `PI_SIGNAL_ATTACHMENTS_DIR` and auto-cleaned after
 | `PI_SIGNAL_DAEMON_URL` | No | `http://127.0.0.1:8090` | Base URL of the bbernhard/signal-cli-rest-api container (REST + WebSocket) |
 | `PI_SIGNAL_ALLOWLIST` | No | empty = self only | Comma-separated E.164 numbers allowed to send/receive with the agent. `PI_SIGNAL_ACCOUNT` is always allowed regardless. |
 | `PI_SIGNAL_STATS` | No | `short` | Stats mode: `off`, `short`, or `full` |
-| `PI_SIGNAL_DEBUG` | No | `false` | Set `"true"` or `"1"` to enable verbose debug logging from the Signal extension |
+| `PI_SIGNAL_DEBUG` | No | `false` | Set to `"true"`, `"1"`, or `"log"` to enable verbose debug logging. When on, `createDebug()` output and all `isLoggingEnabled()`-gated `console.error`/`console.warn` calls are emitted. |
 | `PI_SIGNAL_ATTACHMENTS_DIR` | No | `/tmp/pi-signal/attachments` | Directory for downloaded media attachments (images, PDFs) |
 | `PI_SIGNAL_MAX_ATTACHMENT_AGE_DAYS` | No | `7` | Days before old attachments are auto-deleted |
 
@@ -124,7 +126,7 @@ curl -s http://127.0.0.1:8090/v1/about   # REST API reachable?
 ```
 
 - `/signal-status` in pi — shows REST API health and WebSocket state
-- `PI_SIGNAL_DEBUG=true` — verbose extension logging (WebSocket frames, parsing, sends)
+- `PI_SIGNAL_DEBUG=true` — verbose extension logging (WebSocket frames, parsing, sends, REST requests, attachment downloads)
 
 See [skills/signal/SKILL.md](skills/signal/SKILL.md) for full troubleshooting.
 
@@ -137,7 +139,10 @@ pi-signal/
 ├── CHANGELOG.md
 ├── LICENSE
 ├── extensions/
-│   └── signal.ts                # Main extension (REST + WebSocket)
+│   ├── signal.ts                # Business logic / plumbing (commands, WebSocket, agent integration)
+│   ├── utils.ts                 # Shared utilities (phone parsing, fuzzy match, envelope parsing)
+│   ├── rest-client.ts           # REST API client for signal-cli container
+│   └── attachments.ts           # Attachment download and cleanup
 ├── skills/
 │   └── signal/SKILL.md          # Full setup & troubleshooting guide
 └── scripts/

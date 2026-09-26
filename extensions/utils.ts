@@ -2,7 +2,7 @@
 
 export function isLoggingEnabled(): boolean {
 	const val = (typeof process !== "undefined"
-		? (process.env.PI_SIGNAL_LOGGING || process.env.PI_SIGNAL_DEBUG || "false")
+		? (process.env.PI_SIGNAL_DEBUG || "false")
 		: "false"
 	).toLowerCase();
 	return val === "true" || val === "1" || val === "log";

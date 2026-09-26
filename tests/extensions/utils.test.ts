@@ -377,13 +377,13 @@ describe("isValidE164", () => {
 });
 
 describe("createDebug", () => {
-  const originalLogging = process.env.PI_SIGNAL_LOGGING;
+  const originalLogging = process.env.PI_SIGNAL_DEBUG;
 
   afterEach(() => {
     if (originalLogging !== undefined) {
-      process.env.PI_SIGNAL_LOGGING = originalLogging;
+      process.env.PI_SIGNAL_DEBUG = originalLogging;
     } else {
-      delete process.env.PI_SIGNAL_LOGGING;
+      delete process.env.PI_SIGNAL_DEBUG;
     }
   });
 
@@ -392,71 +392,71 @@ describe("createDebug", () => {
     expect(typeof debug).toBe("function");
   });
 
-  it("does not log when PI_SIGNAL_LOGGING is not set", () => {
-    delete process.env.PI_SIGNAL_LOGGING;
+  it("does not log when PI_SIGNAL_DEBUG is not set", () => {
+    delete process.env.PI_SIGNAL_DEBUG;
     const debug = createDebug("test");
     debug("hello");
     expect(console.log).not.toHaveBeenCalled();
   });
 
-  it("does not log when PI_SIGNAL_LOGGING is 'false'", () => {
-    process.env.PI_SIGNAL_LOGGING = "false";
+  it("does not log when PI_SIGNAL_DEBUG is 'false'", () => {
+    process.env.PI_SIGNAL_DEBUG = "false";
     const debug = createDebug("test");
     debug("hello");
     expect(console.log).not.toHaveBeenCalled();
   });
 
-  it("does not log when PI_SIGNAL_LOGGING is '0'", () => {
-    process.env.PI_SIGNAL_LOGGING = "0";
+  it("does not log when PI_SIGNAL_DEBUG is '0'", () => {
+    process.env.PI_SIGNAL_DEBUG = "0";
     const debug = createDebug("test");
     debug("hello");
     expect(console.log).not.toHaveBeenCalled();
   });
 
-  it("does not log when PI_SIGNAL_LOGGING is 'no'", () => {
-    process.env.PI_SIGNAL_LOGGING = "no";
+  it("does not log when PI_SIGNAL_DEBUG is 'no'", () => {
+    process.env.PI_SIGNAL_DEBUG = "no";
     const debug = createDebug("test");
     debug("hello");
     expect(console.log).not.toHaveBeenCalled();
   });
 
-  it("logs when PI_SIGNAL_LOGGING is 'true'", () => {
-    process.env.PI_SIGNAL_LOGGING = "true";
+  it("logs when PI_SIGNAL_DEBUG is 'true'", () => {
+    process.env.PI_SIGNAL_DEBUG = "true";
     const debug = createDebug("signal");
     debug("hello world");
     expect(console.log).toHaveBeenCalledWith("[signal]", "hello world");
   });
 
-  it("logs when PI_SIGNAL_LOGGING is '1'", () => {
-    process.env.PI_SIGNAL_LOGGING = "1";
+  it("logs when PI_SIGNAL_DEBUG is '1'", () => {
+    process.env.PI_SIGNAL_DEBUG = "1";
     const debug = createDebug("signal");
     debug("hello world");
     expect(console.log).toHaveBeenCalledWith("[signal]", "hello world");
   });
 
-  it("logs when PI_SIGNAL_LOGGING is 'log'", () => {
-    process.env.PI_SIGNAL_LOGGING = "log";
+  it("logs when PI_SIGNAL_DEBUG is 'log'", () => {
+    process.env.PI_SIGNAL_DEBUG = "log";
     const debug = createDebug("signal");
     debug("hello world");
     expect(console.log).toHaveBeenCalledWith("[signal]", "hello world");
   });
 
   it("uses case-insensitive LOGGING values", () => {
-    process.env.PI_SIGNAL_LOGGING = "TRUE";
+    process.env.PI_SIGNAL_DEBUG = "TRUE";
     const debug = createDebug("signal");
     debug("upper case");
     expect(console.log).toHaveBeenCalledWith("[signal]", "upper case");
   });
 
   it("logs multiple arguments", () => {
-    process.env.PI_SIGNAL_LOGGING = "true";
+    process.env.PI_SIGNAL_DEBUG = "true";
     const debug = createDebug("test");
     debug("msg", "arg1", { key: "value" }, 42);
     expect(console.log).toHaveBeenCalledWith("[test]", "msg", "arg1", { key: "value" }, 42);
   });
 
   it("includes the prefix in all log calls", () => {
-    process.env.PI_SIGNAL_LOGGING = "true";
+    process.env.PI_SIGNAL_DEBUG = "true";
     const debug = createDebug("attachments");
     debug("downloaded", "/path/to/file.jpg");
     expect(console.log).toHaveBeenCalledWith(
@@ -467,7 +467,7 @@ describe("createDebug", () => {
   });
 
   it("uses a different prefix for different debug functions", () => {
-    process.env.PI_SIGNAL_LOGGING = "true";
+    process.env.PI_SIGNAL_DEBUG = "true";
     const debug1 = createDebug("signal");
     const debug2 = createDebug("attachments");
     debug1("message 1");
