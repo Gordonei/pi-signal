@@ -29,22 +29,34 @@ You can also send the response to someone else in your contacts using their name
 
 ## Installation
 
-**Prerequisites:** [Docker](https://www.docker.com/) (or Podman), a Signal app on your phone. 
+> **Note:** Setting up the [bbernhard/signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) container is **outside the scope of this Pi extension**. This extension assumes a running REST API container and handles only the integration between that container and pi. The container requires an interactive terminal for QR-code device linking, which cannot be fully automated from within pi.
+
+**Prerequisites:** [Docker](https://www.docker.com/) (or Podman), a Signal app on your phone.
+
+### 1. Set up the Signal REST API container
 
 ```bash
-# 1. Install the pi package
-pi install @gordoneiza/pi-signal
-
-# 2. Run the signal-cli REST API container (adjust image/port/volume to taste)
-docker run -d --name signal-api --restart unless-stopped \
+# Run the signal-cli REST API container
+sudo docker run -d --name signal-api --restart unless-stopped \
   -p 127.0.0.1:8090:8080 \
   -v signal-api-data:/root/.local/share/signal-cli \
   bbernhard/signal-cli-rest-api
 
-# 3. Link your Signal account (QR scan, as the account you want pi to use)
-docker exec -it signal-api signal-cli -a +1234567890 link
+# Link your Signal account (opens a QR scan — use a real terminal)
+sudo docker exec -it signal-api signal-cli -a +1234567890 link
+```
 
-# 4. Configure pi — add these to your shell config (~/.bashrc, ~/.zshrc, ...):
+### 2. Install the pi package
+
+```bash
+pi install @gordoneiza/pi-signal
+```
+
+### 3. Configure environment variables
+
+Add these to your shell config (`~/.bashrc`, `~/.zshrc`, …):
+
+```bash
 export PI_SIGNAL_ACCOUNT=+1234567890   # your Signal number (E.164)
 export PI_SIGNAL_PRIMARY=true          # marks this instance as the one handling Signal
 # Optional — numbers allowed to send/receive with the agent (self is always allowed):
@@ -52,10 +64,13 @@ export PI_SIGNAL_PRIMARY=true          # marks this instance as the one handling
 # Optional — download media attachments (images, PDFs) to disk:
 # export PI_SIGNAL_ATTACHMENTS_DIR=/tmp/pi-signal/attachments  # default
 # export PI_SIGNAL_MAX_ATTACHMENT_AGE_DAYS=7                     # default
+```
 
-# 5. Start pi (restart it or run /reload if already running), then verify:
+### 4. Start pi and verify
+
+```bash
 pi
-# /signal-setup  — setup guidance (where the REST API container must be running)
+# /signal-setup  — setup guidance (checks the REST API container is running)
 # /signal-status — shows REST API health + WebSocket state
 ```
 
@@ -145,8 +160,6 @@ pi-signal/
 │   └── attachments.ts           # Attachment download and cleanup
 ├── skills/
 │   └── signal/SKILL.md          # Full setup & troubleshooting guide
-└── scripts/
-    └── setup.sh                 # Interactive Docker setup wizard (container "signal-api")
 ```
 
 ## License
