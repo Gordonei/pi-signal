@@ -24,43 +24,36 @@ Java and signal-cli are **not** needed on the host — they run inside the conta
 
 ## Installation
 
-Installing the pi package (via npm) and provisioning the container (via `setup.sh`) are two
-separate steps — the package ships `scripts/setup.sh` inside it, so no `git clone` is needed.
+> **Note:** Setting up the [bbernhard/signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) container is **outside the scope of this Pi extension**. This extension assumes a running REST API container and handles only the integration between that container and pi. The container requires an interactive terminal for QR-code device linking, which cannot be fully automated from within pi.
+
+### Step 1 — Run the Signal REST API container
 
 ```bash
-# 1. Install the pi package
+docker run -d --name signal-api --restart unless-stopped \
+  -p 127.0.0.1:8090:8080 \
+  -v signal-api-data:/root/.local/share/signal-cli \
+  bbernhard/signal-cli-rest-api
+```
+
+### Step 2 — Link your Signal account
+
+Open an interactive terminal (the QR scan needs a real TTY):
+
+```bash
+docker exec -it signal-api signal-cli -a +1234567890 link
+```
+
+In the Signal app on your phone: **Settings → Linked Devices → Link New Device** → scan the QR code.
+
+### Step 3 — Install the pi package
+
+```bash
 pi install @gordoneiza/pi-signal
 ```
 
-Restart pi or run `/reload`.
+### Step 4 — Set environment variables
 
-## Step 2 — Run the setup wizard
-
-```
-/signal-setup
-```
-
-This prints setup guidance — the bbernhard/signal-cli-rest-api container must be
-reachable at `PI_SIGNAL_DAEMON_URL` (default `http://127.0.0.1:8090`). Use
-`/signal-status` to verify reachability. If the container isn't running yet, run
-the wizard in a real terminal:
-
-```bash
-bash <installed-path>/scripts/setup.sh
-```
-
-pi's command can't run it for you — the script needs a blocking phone QR scan,
-and `pi.exec` runs commands without a terminal attached. It will:
-1. Find a container runtime (docker or podman)
-2. Ask for your Signal number (E.164)
-3. Reuse or recreate the `signal-api` container (volume `signal-api-data` keeps link state)
-4. Publish `127.0.0.1:8090:8080` and start the `bbernhard/signal-cli-rest-api` container
-5. Link your Signal device (`signal-cli -a NUMBER link` — QR scan)
-6. Verify the REST API (`/v1/about`) and print the export lines to add to your shell config
-
-## Step 3 — Set environment variables
-
-Add to your shell config (`~/.profile`, `~/.zshrc`, etc.) — `setup.sh` prints these at the end:
+Add to your shell config (`~/.bashrc`, `~/.zshrc`, `~/.profile`, etc.):
 
 ```bash
 export PI_SIGNAL_ACCOUNT=+1234567890   # your Signal number (E.164)
@@ -71,7 +64,7 @@ export PI_SIGNAL_PRIMARY=true          # marks this instance as handling Signal
 
 Then reload: `source ~/.profile`, restart pi (or `/reload`).
 
-## Step 4 — Test it
+## Verify it works
 
 Verify with `/signal-setup` and `/signal-status` in pi, then send a Note-to-Self
 message from your phone. pi receives it (👀) and responds (✅).
@@ -147,7 +140,7 @@ pi extension (signal.ts)
 | `PI_SIGNAL_DAEMON_URL` | No | `http://127.0.0.1:8090` | Base URL of the bbernhard/signal-cli-rest-api container (REST + WebSocket) |
 | `PI_SIGNAL_ALLOWLIST` | No | empty = self only | Comma-separated E.164 numbers allowed to send/receive with the agent. `PI_SIGNAL_ACCOUNT` is always allowed regardless. |
 | `PI_SIGNAL_STATS` | No | `short` | Default stats mode: `off`, `short`, or `full` |
-| `PI_SIGNAL_DEBUG` | No | `false` | Set to `"true"` or `"1"` to enable verbose debug logging from the Signal extension. When off, only `console.error` messages appear. |
+| `PI_SIGNAL_DEBUG` | No | `false` | Set to `"true"`, `"1"`, or `"log"` to enable verbose debug logging from the Signal extension. When off, only `console.error` messages appear. |
 | `PI_SIGNAL_ATTACHMENTS_DIR` | No | `/tmp/pi-signal/attachments` | Directory where incoming media attachments (images, PDFs) are downloaded |
 | `PI_SIGNAL_MAX_ATTACHMENT_AGE_DAYS` | No | `7` | Days after which old attachment files are auto-deleted |
 
@@ -233,7 +226,7 @@ These are also available as slash commands in pi's interactive TUI mode:
 
 | Command | Purpose |
 |---|---|
-| `/signal-setup` | Setup guidance (container must be reachable at `PI_SIGNAL_DAEMON_URL`); run `setup.sh` for the full Docker wizard |
+| `/signal-setup` | Show setup guidance (container must be reachable at `PI_SIGNAL_DAEMON_URL`); verifies the REST API is running |
 | `/signal-status` | Show REST API health (`/v1/about`), WebSocket state, account, stats mode |
 | `/signal-send <+E164> <msg>` | Send a Signal message from the TUI (validates E.164, subject to the allowlist) |
 | `/signal-model <name>` | Switch model by fuzzy-matching partial name |
@@ -308,4 +301,3 @@ curl -s http://127.0.0.1:8090/v1/about
 |---|---|
 | Container | `signal-api` (image `bbernhard/signal-cli-rest-api`) |
 | Container volume | `signal-api-data` (signal-cli data, mounted at `/root/.local/share/signal-cli`) |
-| Setup wizard | `scripts/setup.sh` in the installed package |
