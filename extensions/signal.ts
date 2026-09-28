@@ -7,6 +7,7 @@ import { Type } from "typebox";
 import * as attachments from "./attachments.js";
 import { createSignalRestClient } from "./rest-client.js";
 import { ATTACHMENTS_DIR } from "./attachments.js";
+import * as commands from "./commands.js";
 import {
 	createDebug,
 	isLoggingEnabled,
@@ -14,7 +15,6 @@ import {
 	levenshtein,
 	fuzzyMatchModels,
 	sanitizeContactName,
-	formatTokens,
 	buildStatsFooter,
 	normalizePhoneNumber,
 	isValidE164,
@@ -265,61 +265,61 @@ export default function (pi: ExtensionAPI) {
 		reply: (text: string) => void,
 	): Promise<void> {
 		const query = args.join(" ").trim();
-		if (!query) {
-			const current = ctx.model;
-			const name = current?.name || current?.id || "unknown";
-			reply(`Current model: ${name} (${current?.provider || "?"})\n\nUsage: /model <partial name>\nExamples: /model claude, /model gpt, /model sonnet`);
-			return;
-		}
+
+		// Get the current model info for the "no query" case
+		const currentModel = ctx.model
+			? { name: ctx.model.name, id: ctx.model.id, provider: ctx.model.provider }
+			: null;
 
 		const models = getModelList(ctx);
-		if (models.length === 0) {
-			reply("No models available. Configure a provider first.");
-			return;
-		}
-
 		const matches = fuzzyMatchModelsLocal(query, models);
 
+		// Call the pure function to get the response message
+		const modelResponse = commands.buildModelResponse({
+			query,
+			currentModel,
+			models,
+			matches,
+		});
+
+		// Handle the different response types
+		switch (modelResponse.type) {
+			case "current":
+				reply(modelResponse.message);
+				return;
+			case "no_models":
+				reply(modelResponse.message);
+				return;
+			case "exact_match":
+				// Exact match case handled separately below
+				break;
+			case "no_close_match":
+				reply(modelResponse.message);
+				return;
+			case "single_match": {
+				// Find the actual model entry for switching
+				const match = models.find((m) => m.label === modelResponse.label);
+				if (match) {
+					const ok = await pi.setModel(match.model as any);
+					reply(ok ? `Switched to ${match.label}` : `Failed to switch to ${match.label}. Check API key configuration.`);
+				}
+				return;
+			}
+			case "multiple_matches":
+				reply(modelResponse.message);
+				return;
+		}
+
+		// Handle exact model ID match (bypasses fuzzy search)
 		const qLower = query.toLowerCase().trim();
 		for (const entry of models) {
 			const entryObj = entry.model as { id?: string };
 			if (entryObj.id && entryObj.id.toLowerCase() === qLower) {
 				const ok = await pi.setModel(entry.model as any);
-				if (ok) {
-					reply(`Switched to ${entry.label}`);
-				} else {
-					reply(`Failed to switch to ${entry.label}. Check API key configuration.`);
-				}
+				reply(ok ? `Switched to ${entry.label}` : `Failed to switch to ${entry.label}. Check API key configuration.`);
 				return;
 			}
 		}
-
-		const good = matches.filter((m) => m.score < 0.5);
-		if (good.length === 0) {
-			const closest = matches.slice(0, 5);
-			const lines = closest.map((m, i) => `${i + 1}. ${m.label}`);
-			reply(
-				`No close match for "${query}". Did you mean:\n${lines.join("\n")}`,
-			);
-			return;
-		}
-
-		const best = good[0];
-		if (good.length === 1 && best.score < 0.15) {
-			const ok = await pi.setModel(best.model as any);
-			if (ok) {
-				reply(`Switched to ${best.label}`);
-			} else {
-				reply(`Failed to switch to ${best.label}. Check API key configuration.`);
-			}
-			return;
-		}
-
-		const show = good.slice(0, 10);
-		const lines = show.map((m, i) => `${i + 1}. ${m.label}`);
-		reply(
-			`Multiple matches for "${query}":\n${lines.join("\n")}\n\nSend a more specific query.`,
-		);
 	}
 
 	async function handleAbortCommand(
@@ -327,13 +327,17 @@ export default function (pi: ExtensionAPI) {
 		parsed: { sender: string; number: string; body: string; timestamp: number },
 		reply: (text: string) => void,
 	): Promise<void> {
-		if (ctx.isIdle()) {
-			reply("Nothing to abort — the agent is idle.");
+		// Call pure function for the response message
+		const abortResponse = commands.buildAbortResponse(ctx.isIdle());
+
+		if (abortResponse.message.includes("idle")) {
+			reply(abortResponse.message);
 			return;
 		}
 
+		// Side effect: abort the agent
 		ctx.abort();
-		reply("⏹ Response aborted.");
+		reply(abortResponse.message);
 
 		if (parsed.timestamp) {
 			await removeReaction(parsed.number, parsed.number, parsed.timestamp);
@@ -351,7 +355,9 @@ export default function (pi: ExtensionAPI) {
 			await new Promise((r) => setTimeout(r, 300));
 		}
 
-		reply("🧹 Starting new session…");
+		// Call pure function for the response message
+		const clearMessage = commands.buildClearMessage(ctx.isIdle());
+		reply(clearMessage);
 
 		try {
 			if (typeof (ctx as any).newSession === "function") {
@@ -377,14 +383,15 @@ export default function (pi: ExtensionAPI) {
 
 		if (!arg) {
 			const ctx = extCtx;
-			let usageLine = "";
-			if (ctx) {
-				const usage = ctx.getContextUsage?.();
-				if (usage?.percent != null) {
-					usageLine = ` · ${Math.round(usage.percent)}% context used`;
-				}
-			}
-			reply(`Stats mode: ${statsMode}${usageLine}\n\nUsage:\n/stats short — enable short stats (default)\n/stats full  — enable full stats\n/stats off   — disable stats`);
+			const usage = ctx?.getContextUsage?.();
+			const percent = usage?.percent ?? undefined;
+
+			// Call pure function for the response
+			const statsResponse = commands.buildStatsResponse({
+				statsMode,
+				percent,
+			});
+			reply(statsResponse.message);
 			return;
 		}
 
@@ -479,19 +486,9 @@ export default function (pi: ExtensionAPI) {
 		parsed: { sender: string; number: string; body: string; timestamp: number },
 		reply: (text: string) => void,
 	): Promise<void> {
-		reply(
-			"Available commands:\n" +
-			"/model <name> — switch model (fuzzy match)\n" +
-			"/abort — stop current generation\n" +
-			"/clear — start new session\n" +
-			"/stats [short|full|off] — toggle usage stats\n" +
-			"/status — show live connection & model info\n" +
-			"/whoami — show model, directory, and session\n" +
-			"/resend — resend the last reply\n" +
-			"/pause — stop processing incoming messages\n" +
-			"/resume — resume processing\n" +
-			"/help — show this help",
-		);
+		// Call pure function for the help response
+		const helpResponse = commands.buildHelpResponse();
+		reply(helpResponse.message);
 	}
 
 	async function handleStatusCommand(
@@ -500,29 +497,53 @@ export default function (pi: ExtensionAPI) {
 	): Promise<void> {
 		const ctx = extCtx;
 		const model = ctx?.model;
-		const modelName = model?.name || model?.id || "unknown";
-		const providerSuffix = model?.provider ? ` (${model.provider})` : "";
-		const lines = [
-			"✅ pi is up and receiving Signal.",
-			`Account: ${PI_SIGNAL_ACCOUNT || "(not set)"}`,
-			`Primary: ${PI_SIGNAL_PRIMARY ? "yes" : "no"}`,
-			`REST API: ${wsConnected ? "connected" : "disconnected"}`,
-			`Model: ${modelName}${providerSuffix}`,
-			`Stats: ${statsMode}`,
-			`State: ${paused ? "⏸ paused (send /resume)" : "active"}`,
-		];
-		reply(lines.join("\n"));
+
+		// Gather session info from sessionManager
+		let sessionName: string | undefined;
+		let sessionFile: string | undefined;
+		let sessionId: string | undefined;
+		if (ctx?.sessionManager) {
+			sessionName = ctx.sessionManager.getSessionName?.();
+			sessionFile = ctx.sessionManager.getSessionFile?.();
+			sessionId = ctx.sessionManager.getSessionId?.();
+		}
+		// Fallback to pi.getSessionName
+		if (!sessionName) {
+			try {
+				sessionName = pi.getSessionName?.();
+			} catch {}
+		}
+
+		// Gather context usage stats
+		const usage = ctx?.getContextUsage?.();
+
+		// Call the pure function to build the status response
+		const statusResponse = commands.buildStatusResponse({
+			ctxTokens: usage?.tokens ?? null,
+			ctxWindow: usage?.contextWindow ?? null,
+			ctxPercent: usage?.percent ?? null,
+			modelName: model?.name || model?.id || "unknown",
+			modelProvider: model?.provider,
+			account: PI_SIGNAL_ACCOUNT,
+			isPrimary: PI_SIGNAL_PRIMARY,
+			wsConnected,
+			statsMode,
+			paused,
+			sessionName,
+			sessionId,
+			sessionFile,
+		});
+
+		reply(statusResponse.message);
 	}
 
 	async function handleResendCommand(
 		parsed: { sender: string; number: string; body: string; timestamp: number },
 		reply: (text: string) => void,
 	): Promise<void> {
-		if (!lastAgentReply) {
-			reply("Nothing to resend yet.");
-			return;
-		}
-		reply(lastAgentReply);
+		// Call pure function for the response
+		const resendResponse = commands.buildResendResponse(lastAgentReply);
+		reply(resendResponse.message);
 	}
 
 	async function handleWhoamiCommand(
@@ -531,48 +552,54 @@ export default function (pi: ExtensionAPI) {
 	): Promise<void> {
 		const ctx = extCtx;
 		const model = ctx?.model;
-		const modelName = model?.name || model?.id || "unknown";
-		const providerSuffix = model?.provider ? ` (${model.provider})` : "";
 		let sessionName: string | undefined;
 		try {
 			sessionName = pi.getSessionName?.();
 		} catch {
 			sessionName = undefined;
 		}
-		const lines = [
-			`Model: ${modelName}${providerSuffix}`,
-			`Directory: ${ctx?.cwd || "unknown"}`,
-			`Session: ${sessionName || "(unnamed)"}`,
-			`Account: ${PI_SIGNAL_ACCOUNT || "(not set)"}`,
-			`Primary: ${PI_SIGNAL_PRIMARY ? "yes" : "no"}`,
-		];
-		reply(lines.join("\n"));
+
+		// Call the pure function
+		const whoamiResponse = commands.buildWhoamiResponse({
+			modelName: model?.name || model?.id || "unknown",
+			modelProvider: model?.provider,
+			cwd: ctx?.cwd,
+			sessionName,
+			account: PI_SIGNAL_ACCOUNT,
+			isPrimary: PI_SIGNAL_PRIMARY,
+		});
+
+		reply(whoamiResponse.message);
 	}
 
 	async function handlePauseCommand(
 		parsed: { sender: string; number: string; body: string; timestamp: number },
 		reply: (text: string) => void,
 	): Promise<void> {
-		if (paused) {
-			reply("Already paused. Send /resume to re-enable.");
-			return;
+		// Call pure function to determine the response
+		const pauseResult = commands.buildPauseResponse(paused);
+
+		if (pauseResult.paused && !paused) {
+			// Actually transition to paused state
+			paused = true;
 		}
-		paused = true;
-		reply(
-			"⏸ Paused. Incoming messages will be ignored until you send /resume. Commands still work.",
-		);
+
+		reply(pauseResult.message);
 	}
 
 	async function handleResumeCommand(
 		parsed: { sender: string; number: string; body: string; timestamp: number },
 		reply: (text: string) => void,
 	): Promise<void> {
-		if (!paused) {
-			reply("Not paused — messages are already being processed.");
-			return;
+		// Call pure function to determine the response
+		const resumeResult = commands.buildResumeResponse(paused);
+
+		if (resumeResult.resumed) {
+			// Actually transition to resumed state
+			paused = false;
 		}
-		paused = false;
-		reply("▶️ Resumed. Messages will be processed again.");
+
+		reply(resumeResult.message);
 	}
 
 	function injectMessage(parsed: {

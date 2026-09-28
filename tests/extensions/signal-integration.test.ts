@@ -10,7 +10,6 @@ import {
   levenshtein,
   fuzzyMatchModels,
   sanitizeContactName,
-  formatTokens,
   buildStatsFooter,
   normalizePhoneNumber,
   isValidE164,
