@@ -2,6 +2,7 @@
 // TypeScript types are provided by pi at runtime via jiti.
 // This extension uses runtime-only imports; type checking is skipped.
 
+import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import * as attachments from "./attachments.js";
@@ -70,11 +71,13 @@ const WS_RETRY_DELAY_MAX = 60_000;
 // ── REST client ───────────────────────────────────────────────────────
 const {
 	sendMessage,
+	sendMessageV2,
 	sendReaction,
 	removeReaction,
 	sendTypingIndicator,
 	listContacts,
 	getApiAbout,
+	fileToBase64,
 } = createSignalRestClient({
 	daemonUrl: SIGNAL_DAEMON_URL,
 	account: PI_SIGNAL_ACCOUNT,
@@ -514,8 +517,9 @@ export default function (pi: ExtensionAPI) {
 			} catch {}
 		}
 
-		// Gather context usage stats
+		// Gather context usage stats and busy state (covers Signal, TUI, and all channels)
 		const usage = ctx?.getContextUsage?.();
+		const agentBusy = ctx?.isIdle ? !ctx.isIdle() : false;
 
 		// Call the pure function to build the status response
 		const statusResponse = commands.buildStatusResponse({
@@ -529,6 +533,7 @@ export default function (pi: ExtensionAPI) {
 			wsConnected,
 			statsMode,
 			paused,
+			isBusy: agentBusy,
 			sessionName,
 			sessionId,
 			sessionFile,
@@ -946,8 +951,11 @@ export default function (pi: ExtensionAPI) {
 		name: "signal_send",
 		label: "Signal Send",
 		description:
-			"Send a text message to a Signal user. " +
+			"Send a message to a Signal user, with optional media attachments. " +
 			"Recipient must be a phone number in E.164 format, e.g. +1234567890. " +
+			"For media: each attachment uses 'file' (local path — the tool reads and " +
+			"encodes it) or 'base64' (data URI / raw base64). " +
+			"Send media with no text by omitting 'message'. " +
 			"To send to someone by name, first resolve their number with " +
 			"signal_list_contacts, then call this with that number. " +
 			"Uses the bbernhard/signal-cli-rest-api REST API.",
@@ -956,11 +964,32 @@ export default function (pi: ExtensionAPI) {
 				description:
 					"Recipient phone number in E.164 format, e.g. +1234567890. Include the leading +.",
 			}),
-			message: Type.String({ description: "The message text to send." }),
+			message: Type.Optional(Type.String({
+				description: "The message text. Omit or leave empty to send media only.",
+			})),
+			attachments: Type.Optional(Type.Array(
+				Type.Object({
+					file: Type.Optional(Type.String({
+						description: "Local file path (absolute or cwd-relative) to attach. The tool reads and encodes it.",
+					})),
+					base64: Type.Optional(Type.String({
+						description: "Attachment content as a data URI (e.g. data:image/png;base64,iVBOR...) or raw base64. Mutually exclusive with 'file'.",
+					})),
+				}),
+				{ description: "Media attachments. Each entry needs exactly one of 'file' or 'base64'. Max 50 MB per file." },
+			)),
+			view_once: Type.Optional(Type.Boolean({
+				description: "If true, send the media as view-once (disappearing). Only meaningful when attachments are included.",
+			})),
 		}),
 		async execute(
 			_toolCallId: string,
-			params: { recipient: string; message: string },
+			params: {
+				recipient: string;
+				message?: string;
+				attachments?: Array<{ file?: string; base64?: string }>;
+				view_once?: boolean;
+			},
 			_signal?: AbortSignal,
 		) {
 			const cleaned = normalizePhoneNumber(params.recipient);
@@ -976,46 +1005,118 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
+			// Resolve target ID: Note-to-Self → UUID, external → phone number
 			const isSelf = cleaned === PI_SIGNAL_ACCOUNT;
 			const targetId = isSelf && resolvedAccountId ? resolvedAccountId : cleaned;
-			const ok = await sendMessage(targetId, params.message);
 
-			if (!ok) {
-				throw new Error(`Failed to send Signal message.`);
+			// Build base64_attachments array
+			const atts = params.attachments;
+			const hasAttachments = atts && atts.length > 0;
+			const base64Attachments: string[] = [];
+
+			if (hasAttachments) {
+				for (const att of atts) {
+					const hasFile = att.file !== undefined && att.file !== "";
+					const hasB64 = att.base64 !== undefined && att.base64 !== "";
+
+					if (hasFile && hasB64) {
+						throw new Error("Each attachment needs exactly one of 'file' or 'base64', not both.");
+					}
+					if (!hasFile && !hasB64) {
+						throw new Error("Attachment entry is empty — needs 'file' or 'base64'.");
+					}
+
+					if (hasFile) {
+						// Resolve relative paths against cwd
+						let filePath = att.file!;
+						if (!filePath.startsWith("/") && !filePath.startsWith("file:")) {
+							filePath = path.join(extCtx?.cwd || ".", filePath);
+						}
+						base64Attachments.push(fileToBase64(filePath));
+					} else {
+						// base64: pass through as-is (already a data URI or raw base64)
+						base64Attachments.push(att.base64!);
+					}
+				}
 			}
 
-			// Note: we deliberately do NOT clear the typing indicator here.
-			// The agent_end handler cleans up all typing indicators after the
-			// turn completes. Clearing them here races with the propagation of
-			// the started indicator through the Signal network — the client
-			// may never see it if it's stopped too quickly.
+			// Send via v2 API when attachments are present, otherwise use v1
+			if (hasAttachments) {
+				const res = await sendMessageV2({
+					recipients: [targetId],
+					message: params.message ?? "",
+					base64_attachments: base64Attachments,
+					view_once: params.view_once ?? undefined,
+				});
 
-			if (pendingReaction) {
-				const pr = pendingReaction;
-				pendingReaction = null;
-				removeReaction(pr.recipient, pr.targetAuthor, pr.timestamp)
-					.then(() => {
-						sendReaction(
-							pr.recipient,
-							pr.targetAuthor,
-							pr.timestamp,
-							"✅",
-						).catch(() => {});
-					})
-					.catch(() => {});
+				if (!res.ok) {
+					throw new Error(`Failed to send Signal message: ${res.error}`);
+				}
+
+				if (pendingReaction) {
+					const pr = pendingReaction;
+					pendingReaction = null;
+					removeReaction(pr.recipient, pr.targetAuthor, pr.timestamp)
+						.then(() => {
+							sendReaction(
+								pr.recipient,
+								pr.targetAuthor,
+								pr.timestamp,
+								"✅",
+							).catch(() => {});
+						})
+						.catch(() => {});
+				}
+
+				if (cleaned === PI_SIGNAL_ACCOUNT) {
+					currentSignalSender = null;
+				}
+
+				const count = base64Attachments.length;
+				return {
+					content: [{ type: "text", text: `Message sent to ${cleaned} with ${count} attachment(s).` }],
+					details: {
+						recipient: cleaned,
+						message: params.message ?? "",
+						attachmentCount: count,
+					},
+				};
+			} else {
+				// No attachments: use existing v1 path
+				const message = params.message ?? "";
+				const ok = await sendMessage(targetId, message);
+
+				if (!ok) {
+					throw new Error(`Failed to send Signal message.`);
+				}
+
+				if (pendingReaction) {
+					const pr = pendingReaction;
+					pendingReaction = null;
+					removeReaction(pr.recipient, pr.targetAuthor, pr.timestamp)
+						.then(() => {
+							sendReaction(
+								pr.recipient,
+								pr.targetAuthor,
+								pr.timestamp,
+								"✅",
+							).catch(() => {});
+						})
+						.catch(() => {});
+				}
+
+				if (cleaned === PI_SIGNAL_ACCOUNT) {
+					currentSignalSender = null;
+				}
+
+				return {
+					content: [{ type: "text", text: `Message sent to ${cleaned}.` }],
+					details: {
+						recipient: cleaned,
+						message,
+					},
+				};
 			}
-
-			if (cleaned === PI_SIGNAL_ACCOUNT) {
-				currentSignalSender = null;
-			}
-
-			return {
-				content: [{ type: "text", text: `Message sent to ${cleaned}.` }],
-				details: {
-					recipient: cleaned,
-					message: params.message,
-				},
-			};
 		},
 	});
 

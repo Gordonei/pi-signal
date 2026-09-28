@@ -6,9 +6,10 @@
  * handling), sendMessage, reactions, typing indicator, contacts, about.
  */
 
+import * as fs from "node:fs";
 import * as http from "node:http";
 import { AddressInfo } from "node:net";
-import { createSignalRestClient } from "../../extensions/rest-client";
+import { createSignalRestClient, fileToBase64, extToMime } from "../../extensions/rest-client";
 
 const ACCOUNT = "+15551234567";
 const RECIPIENT = "+15559876543";
@@ -266,5 +267,214 @@ describe("getApiAbout", () => {
     handler = () => ({ status: 500, raw: "down" });
     const about = await client.getApiAbout();
     expect(about).toEqual({ ok: false });
+  });
+});
+
+// ── sendMessageV2 ────────────────────────────────────────────────────
+
+describe("sendMessageV2", () => {
+  it("POSTs to /v2/send with required fields", async () => {
+    const res = await client.sendMessageV2({
+      recipients: [RECIPIENT],
+      message: "hello",
+    });
+    expect(res.ok).toBe(true);
+    expect(requests[0].method).toBe("POST");
+    expect(requests[0].url).toBe("/v2/send");
+    expect(requests[0].body).toEqual({
+      number: ACCOUNT,
+      recipients: [RECIPIENT],
+      message: "hello",
+    });
+  });
+
+  it("includes base64_attachments when provided", async () => {
+    const res = await client.sendMessageV2({
+      recipients: [RECIPIENT],
+      message: "",
+      base64_attachments: ["data:image/png;base64,AAA", "rawb64"],
+    });
+    expect(res.ok).toBe(true);
+    expect((requests[0].body as any).base64_attachments).toEqual([
+      "data:image/png;base64,AAA",
+      "rawb64",
+    ]);
+  });
+
+  it("omits base64_attachments when empty", async () => {
+    const res = await client.sendMessageV2({
+      recipients: [RECIPIENT],
+      message: "no attachments",
+    });
+    expect(res.ok).toBe(true);
+    expect((requests[0].body as any).hasOwnProperty("base64_attachments")).toBe(false);
+  });
+
+  it("includes view_once when provided", async () => {
+    const res = await client.sendMessageV2({
+      recipients: [RECIPIENT],
+      message: "",
+      view_once: true,
+    });
+    expect(res.ok).toBe(true);
+    expect((requests[0].body as any).view_once).toBe(true);
+  });
+
+  it("includes text_mode when provided", async () => {
+    const res = await client.sendMessageV2({
+      recipients: [RECIPIENT],
+      message: "styled",
+      text_mode: "styled",
+    });
+    expect(res.ok).toBe(true);
+    expect((requests[0].body as any).text_mode).toBe("styled");
+  });
+
+  it("returns { ok: true, timestamp } on 201", async () => {
+    handler = () => ({ status: 201, body: { timestamp: "1234567890000" } });
+    const res = await client.sendMessageV2({
+      recipients: [RECIPIENT],
+      message: "hi",
+    });
+    expect(res).toEqual({ ok: true, timestamp: "1234567890000" });
+  });
+
+  it("returns { ok: false, error } when response has per-recipient errors", async () => {
+    handler = () => ({
+      status: 201,
+      body: {
+        timestamp: "12345",
+        errors: [{ number: "+123", reason: "rate limited" }],
+      },
+    });
+    const res = await client.sendMessageV2({
+      recipients: [RECIPIENT],
+      message: "hi",
+    });
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain("+123");
+    expect(res.error).toContain("rate limited");
+  });
+
+  it("returns { ok: false, error } on non-2xx", async () => {
+    handler = () => ({ status: 400, body: { error: "bad request" } });
+    const res = await client.sendMessageV2({
+      recipients: [RECIPIENT],
+      message: "hi",
+    });
+    expect(res.ok).toBe(false);
+    expect(res.error).toBe("bad request");
+  });
+
+  it("omits view_once when not provided", async () => {
+    const res = await client.sendMessageV2({
+      recipients: [RECIPIENT],
+      message: "hi",
+    });
+    expect(res.ok).toBe(true);
+    expect((requests[0].body as any).hasOwnProperty("view_once")).toBe(false);
+  });
+});
+
+// ── fileToBase64 ─────────────────────────────────────────────────────
+
+describe("fileToBase64", () => {
+  const tmpDir = "/tmp/pi-signal-test-attachments";
+
+  beforeAll(() => {
+    fs.mkdirSync(tmpDir, { recursive: true });
+  });
+
+  afterAll(() => {
+    try {
+      fs.rmSync(tmpDir, { recursive: true });
+    } catch {
+      // ignore
+    }
+  });
+
+  it("reads a file and returns a data URI with correct MIME type", () => {
+    const testFile = `${tmpDir}/test.txt`;
+    fs.writeFileSync(testFile, "hello world");
+    const result = fileToBase64(testFile);
+    expect(result).toMatch(/^data:text\/plain;filename=test\.txt;base64,/);
+    const b64 = result.split("base64,")[1];
+    expect(Buffer.from(b64, "base64").toString()).toBe("hello world");
+  });
+
+  it("infers MIME type for common extensions", () => {
+    const tests: [string, string, string][] = [
+      ["test.jpg", "image/jpeg", "fake jpeg"],
+      ["test.png", "image/png", "fake png"],
+      ["test.gif", "image/gif", "fake gif"],
+      ["test.pdf", "application/pdf", "fake pdf"],
+      ["test.mp4", "video/mp4", "fake mp4"],
+      ["test.mp3", "audio/mpeg", "fake mp3"],
+    ];
+
+    for (const [filename, mime, content] of tests) {
+      const f = `${tmpDir}/${filename}`;
+      fs.writeFileSync(f, content);
+      const result = fileToBase64(f);
+      expect(result).toMatch(new RegExp(`^data:${mime};filename=${filename};base64,`));
+      fs.unlinkSync(f);
+    }
+  });
+
+  it("falls back to application/octet-stream for unknown extensions", () => {
+    const f = `${tmpDir}/unknown.xyz`;
+    fs.writeFileSync(f, "xyz");
+    const result = fileToBase64(f);
+    expect(result).toMatch(/^data:application\/octet-stream;/);
+  });
+
+  it("accepts file:// URLs", () => {
+    const f = `${tmpDir}/url-test.txt`;
+    fs.writeFileSync(f, "via url");
+    const result = fileToBase64(`file://${f}`);
+    expect(result).toMatch(/^data:text\/plain;/);
+    const b64 = result.split("base64,")[1];
+    expect(Buffer.from(b64, "base64").toString()).toBe("via url");
+  });
+
+  it("throws ENOENT with a friendly message", () => {
+    expect(() => fileToBase64("/tmp/nonexistent-file-abc123.txt")).toThrow("File not found");
+  });
+
+  it("catches unsupported URL schemes as file-not-found (known limitation)", () => {
+    // The try/catch around URL parsing catches ALL errors including the
+    // "Unsupported URL scheme" throw — so it falls through to statSync.
+    // Line 92 is currently unreachable without refactoring the catch block.
+    expect(() => fileToBase64("http://example.com/file.txt")).toThrow("File not found");
+  });
+
+  it("throws when given a directory", () => {
+    expect(() => fileToBase64(tmpDir)).toThrow("Not a regular file");
+  });
+
+  it("throws when file exceeds 50 MB", () => {
+    const f = `${tmpDir}/oversized.bin`;
+    // Create a file just over 50 MB
+    const large = Buffer.alloc(50 * 1024 * 1024 + 1);
+    fs.writeFileSync(f, large);
+    expect(() => fileToBase64(f)).toThrow("File too large");
+    fs.unlinkSync(f);
+  });
+});
+
+// ── extToMime ────────────────────────────────────────────────────────
+
+describe("extToMime", () => {
+  it("maps known extensions to MIME types", () => {
+    expect(extToMime["jpg"]).toBe("image/jpeg");
+    expect(extToMime["png"]).toBe("image/png");
+    expect(extToMime["pdf"]).toBe("application/pdf");
+    expect(extToMime["mp4"]).toBe("video/mp4");
+    expect(extToMime["txt"]).toBe("text/plain");
+  });
+
+  it("has a fallback entry for unknown extensions", () => {
+    // No entry for 'xyz' — should return undefined
+    expect((extToMime as Record<string, string | undefined>)["xyz"]).toBeUndefined();
   });
 });

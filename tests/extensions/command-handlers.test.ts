@@ -25,6 +25,7 @@ interface HandlerCall {
 		currentModel?: any;
 		isIdle?: boolean;
 		paused?: boolean;
+		isBusy?: boolean;
 		statsMode?: string;
 		lastReply?: string;
 		ctxTokens?: number | null;
@@ -139,6 +140,7 @@ async function simulateHandlerCall(call: HandlerCall): Promise<{
 
 			lines.push(`Stats: ${statsMode}`);
 			lines.push(`State: ${paused ? "⏸ paused (send /resume)" : "active"}`);
+			lines.push(`Agent: ${mocks.isBusy ? "⚙️ busy" : "idle"}`);
 
 			reply(lines.join("\n"));
 			break;
@@ -418,6 +420,51 @@ describe("Command handlers - handler dispatch", () => {
 
 			// wsConnected is always true in the mock, so REST API shows connected
 			expect(replied).toContain("REST API: connected");
+		});
+
+		it("shows agent idle when not busy", async () => {
+			const { replied } = await simulateHandlerCall({
+				command: "status",
+				args: [],
+				mocks: {
+					currentModel: { name: "gpt-4o" },
+					statsMode: "short",
+					paused: false,
+					isBusy: false,
+				},
+			});
+
+			expect(replied).toContain("Agent: idle");
+			expect(replied).not.toContain("busy");
+		});
+
+		it("shows agent busy when processing a message", async () => {
+			const { replied } = await simulateHandlerCall({
+				command: "status",
+				args: [],
+				mocks: {
+					currentModel: { name: "gpt-4o" },
+					statsMode: "short",
+					paused: false,
+					isBusy: true,
+				},
+			});
+
+			expect(replied).toContain("Agent: ⚙️ busy");
+		});
+
+		it("defaults to idle when isBusy is not provided", async () => {
+			const { replied } = await simulateHandlerCall({
+				command: "status",
+				args: [],
+				mocks: {
+					currentModel: { name: "gpt-4o" },
+					statsMode: "short",
+					paused: false,
+				},
+			});
+
+			expect(replied).toContain("Agent: idle");
 		});
 	});
 

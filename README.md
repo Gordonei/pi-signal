@@ -17,15 +17,21 @@ The extension talks to the [bbernhard/signal-cli-rest-api](https://github.com/bb
 
 Commands (`/model`, `/abort`, `/clear`, `/stats`, `/status`, `/whoami`, `/resend`, `/pause`, `/resume`, `/help`) are handled locally without LLM. Everything else is forwarded to the LLM.
 
+### Note to Self
+
 ![Note-to-Self message](docs/img/note-to-self-img.png)
 
 ![pi agent response](docs/img/pi-agent-response-img.png)
 
-You can also send the response to someone else in your contacts using their name or phone number (the number must be allowlisted — see [Security](#security)).
+### Other numbers
+The extension allows communication with other numbers, provided they're in the configured allowed list:
 
-![Note-to-Self-Send-to message](docs/img/note-to-self-send-to-img.png)
+![Other contact message](docs/img/other-contact-img.png)
 
-![pi agent response](docs/img/pi-agent-response-send-to-img.png)
+### Image handling
+The extension handles attachments by writing to a configured directory (by default `/tmp/pi-signal/attachments`) that are cleaned up after a certain period of time (7 days).
+
+![Attachment handling](docs/img/image-handling.png)
 
 ## Installation
 
@@ -117,7 +123,7 @@ Attachments are stored in `PI_SIGNAL_ATTACHMENTS_DIR` and auto-cleaned after
 
 ## Tools (LLM-accessible)
 
-- **`signal_send`** — Send a Signal message to a phone number (E.164). Blocked for numbers not in the allowlist.
+- **`signal_send`** — Send a Signal message with optional media attachments. `recipient` (E.164) is required; `message` is optional (omit for media-only). Each attachment uses `file` (local path — tool reads & encodes it) or `base64` (data URI / raw base64). Use `view_once: true` for disappearing media. Files capped at 50 MB. Blocked for numbers not in the allowlist.
 - **`signal_status`** — Check connection status and health (REST API reachable, WebSocket connected)
 - **`signal_list_contacts`** — List contacts (name → number) so the agent can resolve a name before sending
 
@@ -150,17 +156,41 @@ See [skills/signal/SKILL.md](skills/signal/SKILL.md) for full troubleshooting.
 ```
 pi-signal/
 ├── package.json
+├── tsconfig.json               # TypeScript config (production)
+├── tsconfig.test.json          # TypeScript config (tests)
 ├── README.md
 ├── CHANGELOG.md
 ├── LICENSE
 ├── extensions/
-│   ├── signal.ts                # Business logic / plumbing (commands, WebSocket, agent integration)
-│   ├── utils.ts                 # Shared utilities (phone parsing, fuzzy match, envelope parsing)
-│   ├── rest-client.ts           # REST API client for signal-cli container
-│   └── attachments.ts           # Attachment download and cleanup
+│   ├── commands.ts             # Command handler registry (/model, /abort, /clear, etc.)
+│   ├── signal.ts               # Core logic / WebSocket / agent integration
+│   ├── utils.ts                # Shared utilities (phone parsing, fuzzy match, envelope parsing)
+│   ├── rest-client.ts          # REST API client for signal-cli container
+│   └── attachments.ts          # Attachment download and cleanup
 ├── skills/
-│   └── signal/SKILL.md          # Full setup & troubleshooting guide
+│   └── signal/SKILL.md         # Full setup & troubleshooting guide
+└── tests/
+    ├── helpers/mocks.ts        # Mock implementations (signal-cli API, WebSocket)
+    ├── setup.ts                # Jest global setup
+    └── extensions/
+        ├── attachments.test.ts
+        ├── command-handlers.test.ts
+        ├── commands.test.ts
+        ├── message.test.ts
+        ├── rest-client.test.ts
+        ├── signal-integration.test.ts
+        └── utils.test.ts
 ```
+
+## Testing
+
+```bash
+npm test              # Run all tests
+npm run test:watch    # Watch mode
+npm run test:coverage # With coverage report
+```
+
+Tests use [Jest](https://jestjs.io/) with [ts-jest](https://www.npmjs.com/package/ts-jest) and [MSW](https://mswjs.io/) for mocking the Signal REST API.
 
 ## License
 

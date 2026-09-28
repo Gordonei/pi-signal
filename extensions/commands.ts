@@ -84,6 +84,7 @@ export function buildStatusResponse(opts: {
 	wsConnected: boolean;
 	statsMode: string;
 	paused: boolean;
+	isBusy: boolean;
 	sessionName?: string;
 	sessionId?: string;
 	sessionFile?: string;
@@ -96,6 +97,7 @@ export function buildStatusResponse(opts: {
 		wsConnected,
 		statsMode,
 		paused,
+		isBusy,
 		sessionName,
 		sessionId,
 		sessionFile,
@@ -133,6 +135,7 @@ export function buildStatusResponse(opts: {
 
 	lines.push(`Stats: ${statsMode}`);
 	lines.push(`State: ${paused ? "⏸ paused (send /resume)" : "active"}`);
+	lines.push(`Agent: ${isBusy ? "⚙️ busy" : "idle"}`);
 
 	return { message: lines.join("\n") };
 }

@@ -47,6 +47,7 @@ describe("buildStatusResponse", () => {
 			wsConnected: true,
 			statsMode: "short",
 			paused: false,
+			isBusy: false,
 		});
 
 		expect(result.message).toContain("✅ pi is up and receiving Signal.");
@@ -70,6 +71,7 @@ describe("buildStatusResponse", () => {
 			wsConnected: false,
 			statsMode: "full",
 			paused: false,
+			isBusy: false,
 		});
 
 		expect(result.message).toContain("REST API: disconnected");
@@ -87,6 +89,7 @@ describe("buildStatusResponse", () => {
 			wsConnected: true,
 			statsMode: "short",
 			paused: false,
+			isBusy: false,
 			sessionName: "my-feature-work",
 			sessionId: "abc123",
 			sessionFile: "/test/session.jsonl",
@@ -108,6 +111,7 @@ describe("buildStatusResponse", () => {
 			wsConnected: true,
 			statsMode: "short",
 			paused: false,
+			isBusy: false,
 		});
 
 		expect(result.message).toContain("Session: (unnamed)");
@@ -126,6 +130,7 @@ describe("buildStatusResponse", () => {
 			wsConnected: true,
 			statsMode: "short",
 			paused: true,
+			isBusy: false,
 		});
 
 		expect(result.message).toContain("⏸ paused (send /resume)");
@@ -142,6 +147,7 @@ describe("buildStatusResponse", () => {
 			wsConnected: true,
 			statsMode: "short",
 			paused: false,
+			isBusy: false,
 		});
 
 		expect(result.message).toMatch(/Context: 15\.0K \/ 200\.0K \(—\)*/);
@@ -158,6 +164,7 @@ describe("buildStatusResponse", () => {
 			wsConnected: true,
 			statsMode: "short",
 			paused: false,
+			isBusy: false,
 		});
 
 		expect(result.message).toContain("Context: 8.5K tokens");
@@ -175,6 +182,7 @@ describe("buildStatusResponse", () => {
 			wsConnected: true,
 			statsMode: "short",
 			paused: false,
+			isBusy: false,
 		});
 
 		expect(result.message).not.toContain("Context:");
@@ -191,6 +199,7 @@ describe("buildStatusResponse", () => {
 			wsConnected: true,
 			statsMode: "short",
 			paused: false,
+			isBusy: false,
 		});
 
 		expect(result.message).toContain("Account: (not set)");
@@ -207,6 +216,7 @@ describe("buildStatusResponse", () => {
 				wsConnected: true,
 				statsMode: "short",
 				paused: false,
+				isBusy: false,
 			});
 
 			expect(result.message).toContain("50%");
@@ -223,6 +233,7 @@ describe("buildStatusResponse", () => {
 				wsConnected: true,
 				statsMode: "short",
 				paused: false,
+				isBusy: false,
 			});
 
 			expect(result.message).toContain("State: active");
@@ -240,12 +251,13 @@ describe("buildStatusResponse", () => {
 				wsConnected: true,
 				statsMode: "short",
 				paused: false,
+				isBusy: false,
 			});
 
 			expect(result.message).toContain("Model: my-custom-model");
 		});
 
-		it("maintains correct field order: core → session → context → stats → state", () => {
+		it("maintains correct field order: core → session → context → stats → state → agent", () => {
 			const result = buildStatusResponse({
 				ctxTokens: 75000,
 				ctxWindow: 200000,
@@ -257,6 +269,7 @@ describe("buildStatusResponse", () => {
 				wsConnected: true,
 				statsMode: "full",
 				paused: false,
+				isBusy: false,
 				sessionName: "full-test-session",
 				sessionId: "test-uuid-123",
 				sessionFile: "/test/path/session.jsonl",
@@ -270,13 +283,104 @@ describe("buildStatusResponse", () => {
 			const contextLineIdx = lines.findIndex((l) => l.startsWith("Context:"));
 			const statsIdx = lines.findIndex((l) => l.startsWith("Stats:"));
 			const stateIdx = lines.findIndex((l) => l.startsWith("State:"));
+			const agentIdx = lines.findIndex((l) => l.startsWith("Agent:"));
 
 			expect(accountIdx).toBeLessThan(modelIdx);
 			expect(modelIdx).toBeLessThan(sessionLineIdx);
 			expect(sessionLineIdx).toBeLessThan(contextLineIdx);
 			expect(contextLineIdx).toBeLessThan(statsIdx);
 			expect(statsIdx).toBeLessThan(stateIdx);
+			expect(stateIdx).toBeLessThan(agentIdx);
 		});
+});
+
+describe("buildStatusResponse - isBusy", () => {
+	it("shows agent idle when isBusy is false", () => {
+		const result = buildStatusResponse({
+			ctxTokens: null,
+			ctxWindow: null,
+			ctxPercent: null,
+			modelName: "gpt-4o",
+			account: "+15551234567",
+			isPrimary: true,
+			wsConnected: true,
+			statsMode: "short",
+			paused: false,
+			isBusy: false,
+		});
+
+		expect(result.message).toContain("Agent: idle");
+	});
+
+	it("shows agent busy when isBusy is true", () => {
+		const result = buildStatusResponse({
+			ctxTokens: null,
+			ctxWindow: null,
+			ctxPercent: null,
+			modelName: "claude-sonnet-4",
+			account: "+15551234567",
+			isPrimary: true,
+			wsConnected: true,
+			statsMode: "short",
+			paused: false,
+			isBusy: true,
+		});
+
+		expect(result.message).toContain("Agent: ⚙️ busy");
+	});
+
+	it("shows busy even when paused", () => {
+		const result = buildStatusResponse({
+			ctxTokens: null,
+			ctxWindow: null,
+			ctxPercent: null,
+			modelName: "gpt-4o",
+			account: "+15551234567",
+			isPrimary: true,
+			wsConnected: true,
+			statsMode: "short",
+			paused: true,
+			isBusy: true,
+		});
+
+		expect(result.message).toContain("⏸ paused (send /resume)");
+		expect(result.message).toContain("Agent: ⚙️ busy");
+	});
+
+	it("shows idle and paused correctly together", () => {
+		const result = buildStatusResponse({
+			ctxTokens: null,
+			ctxWindow: null,
+			ctxPercent: null,
+			modelName: "gpt-4o",
+			account: "+15551234567",
+			isPrimary: true,
+			wsConnected: true,
+			statsMode: "short",
+			paused: true,
+			isBusy: false,
+		});
+
+		expect(result.message).toContain("⏸ paused (send /resume)");
+		expect(result.message).toContain("Agent: idle");
+	});
+
+	it("includes agent line in minimal status", () => {
+		const result = buildStatusResponse({
+			ctxTokens: null,
+			ctxWindow: null,
+			ctxPercent: null,
+			modelName: "test-model",
+			account: "",
+			isPrimary: false,
+			wsConnected: false,
+			statsMode: "off",
+			paused: false,
+			isBusy: false,
+		});
+
+		expect(result.message).toContain("Agent: idle");
+	});
 });
 
 describe("buildWhoamiResponse", () => {

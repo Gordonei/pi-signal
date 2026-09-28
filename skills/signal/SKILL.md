@@ -246,7 +246,7 @@ Attachments are auto-cleaned after `PI_SIGNAL_MAX_ATTACHMENT_AGE_DAYS` (default:
 
 | Tool | Purpose |
 |---|---|
-| `signal_send` | Send a Signal message to a phone number (E.164). Blocked for numbers not in the allowlist. |
+| `signal_send` | Send a Signal message with optional media attachments. `recipient` (E.164) is required; `message` is optional (omit for media-only). `attachments` accepts an array of `{ file: "<path>" }` (local file, read and encoded automatically) or `{ base64: "<data-uri>" }` (raw or data URI). Max 50 MB per file. Use `view_once: true` for disappearing media. |
 | `signal_status` | Check REST API reachability and WebSocket connection state |
 | `signal_list_contacts` | List contacts as name → number pairs (optional `query` filter) so the agent can resolve a name to a number before `signal_send` |
 
