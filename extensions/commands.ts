@@ -243,7 +243,7 @@ export function buildAbortResponse(isIdle: boolean): CommandReply {
 /**
  * Build the clear response message.
  */
-export function buildClearMessage(wasIdle: boolean): string {
+export function buildClearMessage(): string {
 	return "🧹 Starting new session…";
 }
 

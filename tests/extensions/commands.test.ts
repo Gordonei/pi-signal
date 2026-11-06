@@ -522,9 +522,8 @@ describe("buildAbortResponse", () => {
 });
 
 describe("buildClearMessage", () => {
-	it("always returns the same message", () => {
-		expect(buildClearMessage(true)).toBe("🧹 Starting new session…");
-		expect(buildClearMessage(false)).toBe("🧹 Starting new session…");
+	it("returns the new-session message", () => {
+		expect(buildClearMessage()).toBe("🧹 Starting new session…");
 	});
 });
 

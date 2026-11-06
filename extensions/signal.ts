@@ -118,6 +118,9 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Feature state ────────────────────────────────────────────────
 
+	/** Captured from the TUI command context so Signal /clear can call it. */
+	let newSession: ((options?: unknown) => Promise<{ cancelled: boolean }>) | null = null;
+
 	let extCtx: ExtensionContext | null = null;
 	let statsMode: "off" | "short" | "full" =
 		DEFAULT_STATS_MODE === "full" ? "full"
@@ -353,24 +356,12 @@ export default function (pi: ExtensionAPI) {
 		parsed: { sender: string; number: string; body: string; timestamp: number },
 		reply: (text: string) => void,
 	): Promise<void> {
-		if (!ctx.isIdle()) {
-			ctx.abort();
-			await new Promise((r) => setTimeout(r, 300));
-		}
-
-		// Call pure function for the response message
-		const clearMessage = commands.buildClearMessage(ctx.isIdle());
-		reply(clearMessage);
-
+		reply("🧹 Starting new session…");
 		try {
-			if (typeof (ctx as any).newSession === "function") {
-				await (ctx as any).newSession({
-					withSession: async (_newCtx: unknown) => {
-						debug("[signal] new session started via /clear");
-					},
-				});
+			if (newSession) {
+				await newSession();
 			} else {
-				debug("[signal] newSession not available on context");
+				debug("[signal] newSession handler not yet available — call /signal-clear in the TUI first");
 			}
 		} catch (err) {
 			if (isLoggingEnabled()) console.error("[signal] /clear error:", err);

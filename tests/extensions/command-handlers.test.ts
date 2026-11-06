@@ -36,6 +36,7 @@ interface HandlerCall {
 		sessionId?: string;
 		modelProvider?: string;
 		cwd?: string;
+		newSessionAvailable?: boolean;
 	};
 }
 
@@ -83,12 +84,13 @@ async function simulateHandlerCall(call: HandlerCall): Promise<{
 			break;
 		}
 		case "clear": {
-			// Simulate handleClearCommand
-			if (!mocks.isIdle) {
-				sideEffects.push("abort");
-			}
+			// Simulate handleClearCommand — uses captured newSession handler
 			reply("🧹 Starting new session…");
-			sideEffects.push("newSession");
+			if (mocks.newSessionAvailable !== false) {
+				sideEffects.push("newSession");
+			} else {
+				sideEffects.push("newSession_unavailable");
+			}
 			break;
 		}
 		case "stats": {
@@ -274,28 +276,26 @@ describe("Command handlers - handler dispatch", () => {
 	});
 
 	describe("/clear handler", () => {
-		it("aborts then starts new session when agent is active", async () => {
+		it("starts new session when newSession is available", async () => {
 			const { replied, sideEffects } = await simulateHandlerCall({
 				command: "clear",
 				args: [],
-				mocks: { isIdle: false },
+				mocks: { isIdle: false, newSessionAvailable: true },
 			});
 
 			expect(replied).toBe("🧹 Starting new session…");
-			expect(sideEffects).toContain("abort");
 			expect(sideEffects).toContain("newSession");
 		});
 
-		it("starts new session when agent is idle", async () => {
+		it("handles missing newSession gracefully", async () => {
 			const { replied, sideEffects } = await simulateHandlerCall({
 				command: "clear",
 				args: [],
-				mocks: { isIdle: true },
+				mocks: { newSessionAvailable: false },
 			});
 
 			expect(replied).toBe("🧹 Starting new session…");
-			expect(sideEffects).toContain("newSession");
-			expect(sideEffects).not.toContain("abort");
+			expect(sideEffects).toContain("newSession_unavailable");
 		});
 	});
 
