@@ -15,7 +15,7 @@ Phone → bbernhard/signal-cli-rest-api (Docker, REST + WebSocket) → pi extens
 
 The extension talks to the [bbernhard/signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) container over REST (send, reactions, contacts, health, typing indicator) and a persistent WebSocket on `/v1/receive/{number}` for incoming messages. While the agent is working on a response, the Signal typing indicator ("message is being written…") is shown to the sender and cleared when the reply arrives. signal-cli itself runs inside its own container.
 
-Commands (`/model`, `/abort`, `/clear`, `/stats`, `/status`, `/whoami`, `/resend`, `/pause`, `/resume`, `/help`) are handled locally without LLM. Everything else is forwarded to the LLM.
+Commands (`/model`, `/abort`, `/clear`, `/stats`, `/status`, `/whoami`, `/resend`, `/pause`, `/resume`, `/help`) are handled locally without LLM. Everything else is forwarded to the LLM as a **steering instruction** — when the agent is busy, your message interrupts and redirects it mid-run rather than queuing behind everything (same behavior as typing in the TUI while the agent works).
 
 ### Note to Self
 
@@ -119,7 +119,7 @@ Attachments are stored in `PI_SIGNAL_ATTACHMENTS_DIR` and auto-cleaned after
 
 ## TUI Commands (in pi)
 
-`/signal-setup`, `/signal-status`, `/signal-send <+E164> <msg>`, `/signal-model`, `/signal-abort`, `/signal-stats`
+`/signal-setup`, `/signal-status`, `/signal-send <+E164> <msg>`, `/signal-model`, `/signal-abort`, `/signal-clear`, `/signal-stats`
 
 ## Tools (LLM-accessible)
 
