@@ -14,6 +14,8 @@ import {
   normalizePhoneNumber,
   isValidE164,
 } from "../../extensions/utils";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 describe("Signal Extension Integration Tests", () => {
   describe("Allowlist behavior (as used in signal.ts)", () => {
@@ -376,6 +378,26 @@ describe("Signal Extension Integration Tests", () => {
       }
 
       expect(paused).toBe(true);
+    });
+  });
+
+  describe("forwardToAgent delivers as steer", () => {
+    it("uses deliverAs: steer in sendUserMessage (not followUp)", () => {
+      // This test verifies that forwardToAgent() in signal.ts uses
+      // deliverAs: "steer" so that Signal messages act as steering
+      // instructions when the agent is busy (like TUI input).
+      // We read the source because the extension cannot be loaded in Jest
+      // due to ESM/CommonJS conflicts with typebox.
+      const signalSource = fs.readFileSync(
+        path.join(__dirname, "..", "..", "extensions", "signal.ts"),
+        "utf8",
+      );
+
+      // Verify the forwardToAgent function uses deliverAs: "steer"
+      expect(signalSource).toMatch(/pi\.sendUserMessage\([^)]+\s*,\s*\{\s*deliverAs:\s*"steer"\s*\}\s*\)/);
+
+      // Verify it does NOT use the old "followUp" mode
+      expect(signalSource).not.toMatch(/pi\.sendUserMessage\([^)]+\s*,\s*\{\s*deliverAs:\s*"followUp"\s*\}\s*\)/);
     });
   });
 });

@@ -482,7 +482,7 @@ export default function (pi: ExtensionAPI) {
 
 		// Format message text, including attachment paths for the LLM to see
 		const formatted = formatIncomingMessage(parsed);
-		pi.sendUserMessage(formatted, { deliverAs: "followUp" });
+		pi.sendUserMessage(formatted, { deliverAs: "steer" });
 	}
 
 	async function handleHelpCommand(
@@ -1274,6 +1274,39 @@ export default function (pi: ExtensionAPI) {
 			}
 			extensionCtx.abort();
 			(extensionCtx.ui as any)?.notify?.("⏹ Response aborted.", "info");
+		},
+	});
+
+	pi.registerCommand("signal-clear", {
+		description: "Start a new session (mirrors TUI /new)",
+		async handler(_args: string, ctx: unknown) {
+			// Capture newSession from the command context for use by Signal /clear.
+			newSession = (ctx as any).newSession;
+
+			const extensionCtx = ctx as ExtensionContext;
+			try {
+				if (typeof newSession === "function") {
+					// Mirrors TUI /new: abort, teardown, shutdown, create new session, start.
+					const result = await newSession();
+					if (result?.cancelled) {
+						(extensionCtx.ui as any)?.notify?.(
+							"New session was cancelled.",
+							"info",
+						);
+					}
+				} else {
+					(extensionCtx.ui as any)?.notify?.(
+						"newSession not available in this context.",
+						"warning",
+					);
+				}
+			} catch (err) {
+				if (isLoggingEnabled()) console.error("[signal] /signal-clear error:", err);
+				(extensionCtx.ui as any)?.notify?.(
+					"Failed to start new session: " + (err as Error).message,
+					"error",
+				);
+			}
 		},
 	});
 

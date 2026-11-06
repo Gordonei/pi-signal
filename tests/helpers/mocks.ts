@@ -1,3 +1,7 @@
+// @ts-nocheck
+// TypeScript types are provided by pi at runtime via jiti.
+// This test helper uses runtime-only imports; type checking is skipped.
+
 /**
  * Mock helpers for testing the pi-signal extension.
  */
